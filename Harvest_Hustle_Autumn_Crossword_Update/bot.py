@@ -1021,6 +1021,13 @@ class DailyMissionClaimView(discord.ui.View):
             return
         await show_objectives(interaction,claim=True)
 
+    @discord.ui.button(label='Back to Farm',emoji='🚜',style=discord.ButtonStyle.secondary)
+    async def back_to_farm(self, interaction:discord.Interaction, button:discord.ui.Button):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message('This farm belongs to another player.',ephemeral=True)
+            return
+        await show_farm(interaction)
+
 @harvest.command(name='objectives',description='View daily missions and claim rewards with the button')
 async def objectives(interaction:discord.Interaction):
     await show_objectives(interaction)
