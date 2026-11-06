@@ -32,7 +32,6 @@ CROPS = {
     'pumpkin': {'name':'🎃 Pumpkins', 'cost':250, 'sale':540, 'hours':8},
     'gourd': {'name':'🍂 Golden Gourds', 'cost':250, 'sale':500, 'hours':12},
 }
-BOOSTS = {'growth': {'name':'🌱 Growth Boost', 'cost':300, 'fraction':0.25, 'limit':3}, 'rush': {'name':'⏳ Harvest Rush', 'cost':600, 'fraction':0.50, 'limit':2}}
 UPGRADES = {'extra_plot': {'name':'🌱 Extra Plot', 'cost':500, 'max':10, 'resale':250}, 'market': {'name':'🛒 Market Stall', 'cost':1200, 'max':2, 'resale':600}}
 
 def plot_price(extra_owned):
@@ -90,7 +89,6 @@ con.execute('''CREATE TABLE IF NOT EXISTS harvest_alerts (
     user_id INTEGER NOT NULL, ready_ts INTEGER NOT NULL,
     PRIMARY KEY(user_id, ready_ts)
 )''')
-con.execute('''CREATE TABLE IF NOT EXISTS boost_purchases (user_id INTEGER NOT NULL, day INTEGER NOT NULL, kind TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,day,kind))''')
 con.commit()
 
 def event():
@@ -209,10 +207,6 @@ class FarmView(discord.ui.View):
     async def upgrades(self,interaction,button):
         await interaction.response.send_message(embed=make_embed('🏡 The Farm Shop', 'Expand your growing space or increase your selling bonus. Upgrades cost coins, but **no planting actions**.', AUTUMN['brown']),view=UpgradeView(self.uid),ephemeral=True)
 
-    @discord.ui.button(label='Time Boosts',emoji='⏳',style=discord.ButtonStyle.secondary,row=3)
-    async def boosts(self, interaction, button):
-        await show_boosts(interaction, self.uid)
-
     @discord.ui.button(label='Daily Missions',emoji='🎯',style=discord.ButtonStyle.secondary,row=2)
     async def objectives(self,interaction,button):
         await show_objectives(interaction)
@@ -252,96 +246,6 @@ class FarmView(discord.ui.View):
         await interaction.response.edit_message(view=None)
         self.stop()
 
-
-class BoostSelect(discord.ui.Select):
-    def __init__(self, uid, kind, slots):
-        self.uid, self.kind = uid, kind
-        super().__init__(placeholder='Choose one growing plot to boost', min_values=1, max_values=1,
-            options=[discord.SelectOption(label=f'Plot {r["slot"]} — {CROPS[r["crop"]]["name"]}', value=str(r['slot']),
-                    description=f'Ready <t:{r["ready_ts"]}:R>') for r in slots[:25]])
-
-    async def callback(self, interaction):
-        uid, kind, slot = self.uid, self.kind, int(self.values[0])
-        cfg = BOOSTS[kind]
-        async with lock:
-            e=event()
-            p=player(uid)
-            if not active(e) or not p:
-                msg='The event is not active or you have not joined.'
-            else:
-                day=max(0,(int(time.time())-e['start_ts'])//86400)
-                r=con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,slot)).fetchone()
-                bought=con.execute('SELECT qty FROM boost_purchases WHERE user_id=? AND day=? AND kind=?',(uid,day,kind)).fetchone()
-                count=bought['qty'] if bought else 0
-                if not r: msg='That plot is no longer planted.'
-                elif r['boost_used']: msg='That crop has already received a boost.'
-                elif crop_ready_ts(r,e)<=int(time.time()): msg='That crop is already ready to harvest.'
-                elif count>=cfg['limit']: msg=f'Daily limit reached ({cfg["limit"]} {cfg["name"]} boosts).'
-                elif p['coins']<cfg['cost']: msg=f'Not enough coins. This boost costs {cfg["cost"]}c.'
-                else:
-                    remaining=crop_ready_ts(r,e)-int(time.time())
-                    saved=max(1,int(remaining*cfg['fraction']))
-                    con.execute('UPDATE plots SET boost_seconds=boost_seconds+?,boost_used=1 WHERE user_id=? AND slot=?',(saved,uid,slot))
-                    con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(cfg['cost'],uid))
-                    con.execute('INSERT INTO boost_purchases(user_id,day,kind,qty) VALUES(?,?,?,1) ON CONFLICT(user_id,day,kind) DO UPDATE SET qty=qty+1',(uid,day,kind))
-                    log_action(uid,e,'boost',f'{kind} plot {slot}',-cfg['cost'])
-                    msg=f'Applied {cfg["name"]} to plot {slot} for {cfg["cost"]}c. Reduced remaining growth time by {saved//60} minutes. New ready time: {stamp(crop_ready_ts(con.execute("SELECT * FROM plots WHERE user_id=? AND slot=?",(uid,slot)).fetchone(),e))}.'
-                con.commit()
-        await show_farm(interaction,latest_action='⏳ **Time Boost:** '+msg,edit_existing=True)
-
-class BoostView(discord.ui.View):
-    def __init__(self,uid,kind,slots):
-        super().__init__(timeout=180)
-        self.uid=uid
-        self.add_item(BoostSelect(uid,kind,slots))
-    async def interaction_check(self,interaction):
-        if interaction.user.id!=self.uid:
-            await interaction.response.send_message('This is not your farm.',ephemeral=True)
-            return False
-        return True
-
-class BoostMenu(discord.ui.View):
-    def __init__(self,uid):
-        super().__init__(timeout=180)
-        self.uid=uid
-    async def interaction_check(self,interaction):
-        if interaction.user.id!=self.uid:
-            await interaction.response.send_message('This is not your farm.',ephemeral=True)
-            return False
-        return True
-    @discord.ui.button(label='Growth Boost · 300c (25%)',emoji='🌱',style=discord.ButtonStyle.success)
-    async def growth(self,interaction,button):
-        await choose_boost(interaction,self.uid,'growth')
-    @discord.ui.button(label='Harvest Rush · 600c (50%)',emoji='⏳',style=discord.ButtonStyle.primary)
-    async def rush(self,interaction,button):
-        await choose_boost(interaction,self.uid,'rush')
-
-async def show_boosts(interaction,uid):
-    async with lock:
-        e=event()
-        if not active(e) or not player(uid):
-            await interaction.response.send_message('The event is not active or you have not joined.',ephemeral=True)
-            return
-        day=max(0,(int(time.time())-e['start_ts'])//86400)
-        counts={k:(lambda r:r['qty'] if r else 0)(con.execute('SELECT qty FROM boost_purchases WHERE user_id=? AND day=? AND kind=?',(uid,day,k)).fetchone()) for k in BOOSTS}
-    msg=('Reduce the **remaining** time on one growing crop. Each crop can receive **one boost only**. '
-         'Boosts do not grant planting actions and cannot be refunded.\n\n'
-         f'🌱 **Growth Boost:** 300c · 25% off remaining time · {counts["growth"]}/3 used today\n'
-         f'⏳ **Harvest Rush:** 600c · 50% off remaining time · {counts["rush"]}/2 used today')
-    await interaction.response.send_message(embed=make_embed('⏳ Time Boost Shop',msg,AUTUMN['green']),view=BoostMenu(uid),ephemeral=True)
-
-async def choose_boost(interaction,uid,kind):
-    async with lock:
-        e=event()
-        slots=[]
-        if active(e):
-            for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,)):
-                if not r['boost_used'] and crop_ready_ts(r,e)>int(time.time()):
-                    slots.append({'slot':r['slot'],'crop':r['crop'],'ready_ts':crop_ready_ts(r,e)})
-    if not slots:
-        await interaction.response.send_message('No eligible growing crops. Plant a crop first; already-boosted or mature crops cannot be boosted.',ephemeral=True)
-        return
-    await interaction.response.send_message(embed=make_embed('⏳ Choose a Plot',f'{BOOSTS[kind]["name"]} costs **{BOOSTS[kind]["cost"]}c**. Select the crop you want to speed up.',AUTUMN['green']),view=BoostView(uid,kind,slots),ephemeral=True)
 
 class CropSelect(discord.ui.Select):
     def __init__(self):
@@ -572,7 +476,8 @@ def role_panel_embed(with_banner=True):
             '🥉 **3rd Place:** 75c + HC Box\n\n'
             '🌻 **React below to get the role** and stay updated with event announcements and reminders!\n\n'
             '📖 Want the full details? Check `/harvest help`.\n'
-            '🌱 Registration opens on 8 November — look for the Join button in the main game channel.'
+            '🗓️ **Event starts: 8 November 2026 at 12:00 AM GMT.**\n'
+            'Keep an eye on the main game channel for the event announcement and Join button.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
     )
@@ -621,7 +526,7 @@ async def role_panel(interaction: discord.Interaction):
                 pass
         # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
         content = '@everyone 🎮 **It’s time for another Discord game!** 🍂 **Harvest Hustle** is coming! React below to get the role. '
-        content += 'Registration opens on 8 November — watch the main game channel for the Join button!'
+        content += '🗓️ **Starts 8 November at 12:00 AM GMT!** Watch the main game channel for the Join button.'
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
         if has_banner:
@@ -773,10 +678,6 @@ async def harvest_help(interaction: discord.Interaction):
         '**Expand your farm**\n'
         '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space, not an extra planting action. Resale value: **50% of purchase price**.\n'
         '🛒 Market Stall: **1,200c** per level, up to **2 levels**. Each level increases produce sale prices by **6%** (maximum +12%). Resale value: **600c** per level.\n\n'
-        '**Time boosts** (Farm → Time Boosts)\n'
-        '🌱 Growth Boost: **300c**, reduces one crop’s remaining time by **25%**, max **3/day**.\n'
-        '⏳ Harvest Rush: **600c**, reduces one crop’s remaining time by **50%**, max **2/day**.\n'
-        'Only one boost per crop. No extra planting actions; purchases are non-refundable.\n\n'
         '**Three daily missions** (claim via `/harvest objectives`)\n'
         '• Plant 2 crops: **+50c**\n'
         '• Harvest 2 crops: **+75c**\n'
@@ -1097,9 +998,6 @@ class HarvestTestView(discord.ui.View):
         self.planted = 0
         self.harvested = 0
         self.sold = 0
-        self.boosted = set()
-        self.boost_reductions = {}
-        self.boost_counts = {'growth': 0, 'rush': 0}
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.host_id:
@@ -1113,9 +1011,6 @@ class HarvestTestView(discord.ui.View):
                 + plot_resale_value(self.extra_plot)
                 + self.market * UPGRADES['market']['resale'])
 
-    def boosted_hours(self,slot):
-        return getattr(self,'boost_reductions',{}).get(slot,0)
-
     def summary(self, latest_action=None):
         lines = []
         for slot in range(1, PLOTS + self.extra_plot + 1):
@@ -1123,7 +1018,7 @@ class HarvestTestView(discord.ui.View):
                 lines.append(f'{slot}. Empty')
             else:
                 crop, planted_session = self.plots[slot]
-                left = max(0, CROPS[crop]['hours'] - (self.test_hour - planted_session) - self.boosted_hours(slot))
+                left = max(0, CROPS[crop]['hours'] - (self.test_hour - planted_session))
                 lines.append(f'{slot}. {CROPS[crop]["name"]} — ' + ('✅ Ready! Click Harvest Ready' if not left else f'⏳ {left} simulated hours remaining'))
         inv = ', '.join(f'{CROPS[k]["name"]} x{qty}' for k, qty in self.inventory.items() if qty) or 'Empty'
         embed = make_embed('🧪 Harvest Hustle — PRIVATE TEST SANDBOX',
@@ -1132,7 +1027,6 @@ class HarvestTestView(discord.ui.View):
                            f'**Planting actions:** {self.actions}/{ACTIONS} used\n'
                            f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
                            f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n\n'
-                           f'**Time boosts used today:** Growth {self.boost_counts["growth"]}/3 · Rush {self.boost_counts["rush"]}/2\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
         if latest_action:
             embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
@@ -1170,10 +1064,8 @@ class HarvestTestView(discord.ui.View):
     @discord.ui.button(label='Harvest Ready', emoji='🧺', style=discord.ButtonStyle.success, row=1)
     async def harvest_test(self, interaction, button):
         ready = [(slot, crop) for slot, (crop, planted) in self.plots.items()
-                 if self.test_hour - planted >= CROPS[crop]['hours'] - self.boosted_hours(slot)]
+                 if self.test_hour - planted >= CROPS[crop]['hours']]
         for slot, crop in ready:
-            self.boosted.discard(slot)
-            self.boost_reductions.pop(slot,None)
             self.inventory[crop] += 1
             del self.plots[slot]
         self.harvested += len(ready)
@@ -1196,10 +1088,8 @@ class HarvestTestView(discord.ui.View):
             self.session=self.test_hour//12
             if self.test_hour//12>previous//12 and self.test_hour<168:
                 self.actions=0
-            if self.test_hour//24>previous//24:
-                self.boost_counts={'growth':0,'rush':0}
             newly_ready=[crop for slot,(crop,planted) in self.plots.items()
-                         if previous < planted + CROPS[crop]['hours'] - self.boosted_hours(slot) <= self.test_hour]
+                         if previous < planted + CROPS[crop]['hours'] <= self.test_hour]
             ready_count=sum(1 for crop, planted in self.plots.values() if self.test_hour-planted>=CROPS[crop]['hours'])
             msg=(f'Advanced to hour {self.test_hour}/168. '
                  + (f'🔔 **SIMULATED HARVEST ALERT:** {len(newly_ready)} crop(s) just matured! '
@@ -1250,28 +1140,6 @@ class HarvestTestView(discord.ui.View):
             logging.info('Could not send test harvest DM to %s: %s', interaction.user.id, exc)
             msg='⚠️ Could not deliver the test DM. Check your Discord DM privacy settings and try again.'
         await self.refresh(interaction, msg)
-
-    @discord.ui.select(placeholder='⏳ Test timer power-up',row=4,options=[
-        discord.SelectOption(label='Growth Boost — 300c · 25%',value='growth'),
-        discord.SelectOption(label='Harvest Rush — 600c · 50%',value='rush')])
-    async def boost_test(self,interaction,select):
-        kind=select.values[0]
-        cfg=BOOSTS[kind]
-        eligible=[(slot,crop,planted) for slot,(crop,planted) in self.plots.items()
-                  if slot not in self.boosted and self.test_hour-planted < CROPS[crop]['hours']]
-        if not eligible: msg='No eligible growing crops to boost.'
-        elif self.boost_counts[kind]>=cfg['limit']: msg='Daily boost limit reached.'
-        elif self.coins<cfg['cost']: msg='Not enough test coins.'
-        else:
-            slot,crop,planted=eligible[0]
-            remaining=CROPS[crop]['hours']-(self.test_hour-planted)
-            reduction=remaining*cfg['fraction']
-            self.boosted.add(slot)
-            self.boost_reductions[slot]=reduction
-            self.boost_counts[kind]+=1
-            self.coins-=cfg['cost']
-            msg=f'Applied {cfg["name"]} to plot {slot} for {cfg["cost"]}c. Saved {reduction:g} simulated hours.'
-        await self.refresh(interaction,msg)
 
     @discord.ui.button(label='Save Farm to DMs', emoji='📩', style=discord.ButtonStyle.secondary, row=3)
     async def save_test(self, interaction, button):
