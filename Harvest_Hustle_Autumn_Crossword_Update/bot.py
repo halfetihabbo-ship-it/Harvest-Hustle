@@ -141,8 +141,39 @@ def board(e):
 def stamp(ts):
     return f'<t:{int(ts)}:F> (<t:{int(ts)}:R>)'
 
-def make_embed(title, description='', color=0xC57B34):
-    return discord.Embed(title=title,description=description,color=color)
+# Consistent, lightweight autumn styling. No external images needed for private actions.
+AUTUMN = {'orange': 0xC47736, 'green': 0x657B43, 'gold': 0xD6A448,
+          'brown': 0x79523D, 'red': 0xA95343}
+
+def make_embed(title, description='', color=AUTUMN['orange']):
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text='🍂 Harvest Hustle  •  Your autumn farming adventure')
+    return embed
+
+def action_embed(message, kind='info'):
+    """Convert existing gameplay results into a clear private autumn card."""
+    success = not any(word in message.lower() for word in (
+        'not enough', 'not currently active', 'not active', 'no crops',
+        'nothing to sell', 'maximum', 'no planting actions', 'all plots',
+        'not joined', 'not ready', 'wait until', 'not currently', 'ended'))
+    names = {
+        'plant': ('🌱 Seeds in the Soil', '🌱 Planting Update'),
+        'harvest': ('🧺 Harvest Complete', '⏳ Harvest Update'),
+        'sell': ('🪙 Produce Sold', '🧺 Market Update'),
+        'upgrade': ('🏡 Farm Expanded', '🏡 Upgrade Shop'),
+        'info': ('🍁 Farm Update', '🍁 Farm Update'),
+    }
+    title = names.get(kind, names['info'])[0 if success else 1]
+    color = AUTUMN['green'] if success else AUTUMN['gold']
+    embed = make_embed(title, message, color)
+    if success and kind == 'harvest':
+        embed.add_field(name='Next step', value='Click **Sell Produce** to turn harvested crops into coins.', inline=False)
+    elif success and kind == 'plant':
+        embed.add_field(name='Next step', value='Your crop grows automatically. Return when the timer finishes and click **Harvest Ready**.', inline=False)
+    elif success and kind == 'sell':
+        embed.add_field(name='Next step', value='Reinvest your earnings with **Plant** or **Upgrades**.', inline=False)
+    return embed
+
 
 def is_host(interaction):
     return interaction.user.id in HOST_IDS
@@ -160,7 +191,7 @@ class FarmView(discord.ui.View):
 
     @discord.ui.button(label='Plant',emoji='🌱',style=discord.ButtonStyle.success,row=0)
     async def plant(self,interaction,button):
-        await interaction.response.send_message('Choose a crop to plant (one action per seed):',view=CropView(self.uid),ephemeral=True)
+        await interaction.response.send_message(embed=make_embed('🌱 Choose Your Seeds', 'Select a crop below to plant in your next empty plot. Each seed costs **1 planting action**.', AUTUMN['green']),view=CropView(self.uid),ephemeral=True)
 
     @discord.ui.button(label='Harvest Ready',emoji='🧺',style=discord.ButtonStyle.primary,row=0)
     async def harvest(self,interaction,button):
@@ -172,7 +203,7 @@ class FarmView(discord.ui.View):
 
     @discord.ui.button(label='Upgrades',emoji='⬆️',style=discord.ButtonStyle.secondary,row=1)
     async def upgrades(self,interaction,button):
-        await interaction.response.send_message('Purchase a permanent upgrade (no planting action required):',view=UpgradeView(self.uid),ephemeral=True)
+        await interaction.response.send_message(embed=make_embed('🏡 The Farm Shop', 'Expand your growing space or increase your selling bonus. Upgrades cost coins, but **no planting actions**.', AUTUMN['brown']),view=UpgradeView(self.uid),ephemeral=True)
 
     @discord.ui.button(label='Daily Missions',emoji='🎯',style=discord.ButtonStyle.secondary,row=2)
     async def objectives(self,interaction,button):
@@ -211,7 +242,7 @@ class CropSelect(discord.ui.Select):
                     log_action(uid,e,'plant',crop,-c['cost'])
                     msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Ready at {stamp(int(time.time())+c['hours']*3600)}, if the event is still running."
                 con.commit()
-        await interaction.response.send_message(msg,ephemeral=True)
+        await interaction.response.send_message(embed=action_embed(msg, 'plant'),ephemeral=True)
 
 class CropView(discord.ui.View):
     def __init__(self,uid):
@@ -258,7 +289,7 @@ async def buy_upgrade(interaction,kind):
                 log_action(uid,e,'upgrade',kind,-price)
                 msg=f"Purchased {cfg['name']} for {price} coins!" + (f' Plots Owned: {available_plots(player(uid))}/{PLOTS + UPGRADES["extra_plot"]["max"]}.' if kind=='extra_plot' else ' Your stored produce sells for 6% more per level.')
             con.commit()
-    await interaction.response.send_message(msg,ephemeral=True)
+    await interaction.response.send_message(embed=action_embed(msg, 'upgrade'),ephemeral=True)
 
 async def do_harvest(interaction,uid):
     async with lock:
@@ -287,7 +318,7 @@ async def do_harvest(interaction,uid):
                     if p['harvested'] < threshold <= p['harvested']+len(ready):
                         msg+=f' 🏅 Milestone reached: {threshold} crops harvested!'
             con.commit()
-    await interaction.response.send_message(msg,ephemeral=True)
+    await interaction.response.send_message(embed=action_embed(msg, 'harvest'),ephemeral=True)
 
 async def do_sell(interaction,uid):
     async with lock:
@@ -305,7 +336,7 @@ async def do_sell(interaction,uid):
                 log_action(uid,e,'sell',f'{sum(x["qty"] for x in items)} crops',earned)
                 msg=f'🪙 Sold {sum(x["qty"] for x in items)} crop(s) for {earned} coins (free).'
             con.commit()
-    await interaction.response.send_message(msg,ephemeral=True)
+    await interaction.response.send_message(embed=action_embed(msg, 'sell'),ephemeral=True)
 
 async def show_farm(interaction):
     uid=interaction.user.id
@@ -337,7 +368,7 @@ async def show_farm(interaction):
                 remaining=max(0,ready_ts-int(time.time()))
                 lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready below**' if remaining==0 else f'⏳ Ready <t:{ready_ts}:R> · <t:{ready_ts}:t>'))
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
-        embed=make_embed('🍂 Your Harvest Hustle Farm',f'**Day {w//2+1} / 7 · Session {w%2+1} / 2**\n**Ends:** {stamp(e["start_ts"]+DURATION)}')
+        embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 7**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
         embed.add_field(name='💰 Coins',value=str(p['coins']))
         embed.add_field(name='🌱 Planting actions left',value=f'{max(0,ACTIONS-p["actions_used"])}/{ACTIONS}')
         embed.add_field(name='🏆 Farm value',value=f'{farm_value(uid,p,e):,}')
@@ -346,9 +377,9 @@ async def show_farm(interaction):
         milestone=max((n for n in (5,15,30,50) if p['harvested']>=n),default=0)
         embed.add_field(name='🏅 Harvest milestone',value=f'{milestone} crops' if milestone else 'Not yet unlocked',inline=True)
         embed.add_field(name='🌱 Plots Owned',value=f'{available_plots(p)}/{PLOTS + UPGRADES["extra_plot"]["max"]} · {len(plots)} occupied · {available_plots(p)-len(plots)} empty',inline=False)
-        embed.add_field(name='🌾 Plot Details',value='\n'.join(lines),inline=False)
+        embed.add_field(name='🌾 Your Growing Plots',value='\n'.join(lines)[:1024],inline=False)
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
-        embed.add_field(name='📊 Career stats',value=f'Planted: {p["planted"]} · Harvested: {p["harvested"]} · Sales Revenue: {p["sold"]:,}c',inline=False)
+        embed.add_field(name='📊 Your Season So Far',value=f'🌱 Planted **{p["planted"]}**  •  🧺 Harvested **{p["harvested"]}**\n🪙 Sales Revenue **{p["sold"]:,}c**',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
         embed.set_footer(text='When a crop is ready, click Harvest Ready, then Sell Produce. Only planting uses actions.')
     await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
@@ -570,7 +601,7 @@ async def leaderboard(interaction:discord.Interaction):
         desc='\n'.join(f'**{i}.** <@{r[3]}> — **{r[0]:,}** farm value' for i,r in enumerate(ranks[:15],1)) or 'No players yet.'
         mine=next((i for i,r in enumerate(ranks,1) if r[3]==interaction.user.id),None)
         if mine and mine>15: desc+=f'\n\n**Your rank:** #{mine} — {ranks[mine-1][0]:,} farm value'
-        embed=make_embed('🏆 Harvest Hustle Leaderboard',desc)
+        embed=make_embed('🏆 Autumn Harvest Leaderboard',desc, AUTUMN['gold'])
         embed.set_footer(text='Ties: farm value → total sales → harvest count → earlier registration → Discord ID.')
     await interaction.response.send_message(embed=embed)
 
@@ -953,7 +984,8 @@ class HarvestTestView(discord.ui.View):
         # Each test action creates a fresh, private result with updated controls.
         # Remove controls from the previous message to avoid stale menus.
         await interaction.response.edit_message(view=None)
-        await interaction.followup.send(content=notice, embed=self.summary(), view=self, ephemeral=True)
+        await interaction.followup.send(embed=action_embed(notice, 'info'), ephemeral=True)
+        await interaction.followup.send(embed=self.summary(), view=self, ephemeral=True)
 
     @discord.ui.select(placeholder='🧪 Plant a test crop', row=0,
                        options=[discord.SelectOption(label=v['name'], value=k,
