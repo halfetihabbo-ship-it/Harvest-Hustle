@@ -273,7 +273,7 @@ class CropSelect(discord.ui.Select):
                     log_action(uid,e,'plant',crop,-c['cost'])
                     msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Ready at {stamp(int(time.time())+c['hours']*3600)}, if the event is still running."
                 con.commit()
-        await interaction.response.send_message(embed=action_embed(msg, 'plant'),ephemeral=True)
+        await show_farm(interaction, latest_action='🌱 **Planting:** ' + msg, edit_existing=True)
 
 class CropView(discord.ui.View):
     def __init__(self,uid):
@@ -320,7 +320,7 @@ async def buy_upgrade(interaction,kind):
                 log_action(uid,e,'upgrade',kind,-price)
                 msg=f"Purchased {cfg['name']} for {price} coins!" + (f' Plots Owned: {available_plots(player(uid))}/{PLOTS + UPGRADES["extra_plot"]["max"]}.' if kind=='extra_plot' else ' Your stored produce sells for 6% more per level.')
             con.commit()
-    await interaction.response.send_message(embed=action_embed(msg, 'upgrade'),ephemeral=True)
+    await show_farm(interaction, latest_action='🏡 **Upgrade:** ' + msg, edit_existing=True)
 
 async def do_harvest(interaction,uid):
     async with lock:
@@ -349,7 +349,7 @@ async def do_harvest(interaction,uid):
                     if p['harvested'] < threshold <= p['harvested']+len(ready):
                         msg+=f' 🏅 Milestone reached: {threshold} crops harvested!'
             con.commit()
-    await interaction.response.send_message(embed=action_embed(msg, 'harvest'),ephemeral=True)
+    await show_farm(interaction, latest_action='🧺 **Harvest:** ' + msg, edit_existing=True)
 
 async def do_sell(interaction,uid):
     async with lock:
@@ -367,9 +367,9 @@ async def do_sell(interaction,uid):
                 log_action(uid,e,'sell',f'{sum(x["qty"] for x in items)} crops',earned)
                 msg=f'🪙 Sold {sum(x["qty"] for x in items)} crop(s) for {earned} coins (free).'
             con.commit()
-    await interaction.response.send_message(embed=action_embed(msg, 'sell'),ephemeral=True)
+    await show_farm(interaction, latest_action='🪙 **Selling:** ' + msg, edit_existing=True)
 
-async def show_farm(interaction):
+async def show_farm(interaction, latest_action=None, edit_existing=False):
     uid=interaction.user.id
     async with lock:
         e=event()
@@ -412,8 +412,13 @@ async def show_farm(interaction):
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
         embed.add_field(name='📊 Your Season So Far',value=f'🌱 Planted **{p["planted"]}**  •  🧺 Harvested **{p["harvested"]}**\n🪙 Sales Revenue **{p["sold"]:,}c**',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
+        if latest_action:
+            embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
         embed.set_footer(text='When a crop is ready, click Harvest Ready, then Sell Produce. Only planting uses actions.')
-    await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
+    if edit_existing:
+        await interaction.response.edit_message(embed=embed, view=FarmView(uid) if active(e) else None)
+    else:
+        await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
 
 # Role panel is a permanent Discord button, restored after bot restarts.
 # Its message ID is saved so a host can update the existing panel rather than spam duplicates.
@@ -1002,7 +1007,7 @@ class HarvestTestView(discord.ui.View):
                 + plot_resale_value(self.extra_plot)
                 + self.market * UPGRADES['market']['resale'])
 
-    def summary(self):
+    def summary(self, latest_action=None):
         lines = []
         for slot in range(1, PLOTS + self.extra_plot + 1):
             if slot not in self.plots:
@@ -1019,14 +1024,14 @@ class HarvestTestView(discord.ui.View):
                            f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
                            f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
+        if latest_action:
+            embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
         embed.set_footer(text='TEST ONLY · No real coins, event records, announcements or leaderboard changes')
         return embed
 
     async def refresh(self, interaction, notice):
-        # Acknowledge without editing/deleting the current ephemeral message.
-        # Discord controls how long ephemeral posts remain visible; never auto-delete them.
-        await interaction.response.send_message(embed=action_embed(notice, 'info'), ephemeral=True)
-        await interaction.followup.send(embed=self.summary(), view=self, ephemeral=True)
+        # Keep the farm and the latest action together in one private message.
+        await interaction.response.edit_message(embed=self.summary(latest_action=notice), view=self)
 
     @discord.ui.select(placeholder='🧪 Plant a test crop', row=0,
                        options=[discord.SelectOption(label=v['name'], value=k,
@@ -1157,7 +1162,7 @@ async def harvest_test(interaction: discord.Interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
     view = HarvestTestView(interaction.user.id)
-    await interaction.response.send_message('Every action opens a fresh private result. Use **Advance 2 Hours** to simulate crop maturity alerts, or **Send Test DM** to check real DM delivery. This test farm is separate from the live game.',
+    await interaction.response.send_message('Your latest action appears at the bottom of this private farm dashboard. Use **Advance 2 Hours** to simulate crop maturity alerts, or **Send Test DM** to check real DM delivery. This test farm is separate from the live game.',
                                             embed=view.summary(), view=view, ephemeral=True)
 
 bot.tree.add_command(harvest)
