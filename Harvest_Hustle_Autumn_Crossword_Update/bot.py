@@ -65,6 +65,7 @@ def add_column(table, column, definition):
     if column not in cols:
         con.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
 add_column('event','registration_ts','INTEGER')
+add_column('event','live_test','INTEGER NOT NULL DEFAULT 0')
 add_column('event','registration_post_id','INTEGER')
 add_column('event','last_session_notice','INTEGER NOT NULL DEFAULT -1')
 add_column('event','midweek_sent','INTEGER NOT NULL DEFAULT 0')
@@ -464,26 +465,28 @@ class HarvestRolePanel(discord.ui.View):
 
 def role_panel_embed(with_banner=True):
     embed = discord.Embed(
-        title='🍂 Harvest Hustle | 7-Day Farming Event',
+        title='🍂🌾 HARVEST HUSTLE — THE AUTUMN CHALLENGE!',
         description=(
-            '🎮 **It’s time for another Discord game!**\n\n'
-            '🚜 **Ready to get your farming boots on?**\n\n'
-            'Plant, grow and harvest your way to the top! Build your farm, '
-            'earn coins and compete with fellow farmers for some lovely prizes. 🌾\n\n'
-            '**🏆 Prizes**\n'
-            '🥇 **1st Place:** 200c + HC Box\n'
-            '🥈 **2nd Place:** 100c + HC Box\n'
-            '🥉 **3rd Place:** 75c + HC Box\n\n'
-            '🌻 **React below to get the role** and stay updated with event announcements and reminders!\n\n'
-            '📖 Want the full details? Check `/harvest help`.\n'
-            '🗓️ **Event starts: 8 November 2026 at 12:00 AM GMT.**\n'
-            'Keep an eye on the main game channel for the event announcement and Join button.'
+            '🎮 **IT’S TIME FOR ANOTHER DISCORD GAME!** 🎮\n\n'
+            '🚜 **Ready to grow your way to victory?** Plant crops, harvest produce, '
+            'earn coins and upgrade your farm to climb the leaderboard!\n\n'
+            '🏆 **BIG PRIZES UP FOR GRABS!** 🏆\n'
+            '🥇 **1ST PLACE — 200 CREDITS + HC BOX**\n'
+            '🥈 **2ND PLACE — 100 CREDITS + HC BOX**\n'
+            '🥉 **3RD PLACE — 75 CREDITS + HC BOX**\n\n'
+            '📅 **EVENT DATES — EXACTLY 7 DAYS**\n'
+            '🟢 **OPENS:** Sunday, **8 November 2026 at 12:00 AM GMT**\n'
+            '🔴 **CLOSES:** Sunday, **15 November 2026 at 12:00 AM GMT**\n\n'
+            '🍁 **WANT TO TAKE PART?**\n'
+            'React below to get the event role and access to the game channels! '
+            'Watch for the separate **Join Harvest Hustle** announcement when the event opens.\n\n'
+            '📖 Use **`/harvest help`** for the full guide.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
     )
     if with_banner:
         embed.set_image(url='attachment://harvest_hustle_role_banner.png')
-    embed.set_footer(text='A little farming, a little competition, and lots of fun!')
+    embed.set_footer(text='🌻 Seven days. One leaderboard. Who will be crowned the harvest champion?')
     return embed
 
 intents=discord.Intents.default()
@@ -526,7 +529,7 @@ async def role_panel(interaction: discord.Interaction):
                 pass
         # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
         content = '@everyone 🎮 **It’s time for another Discord game!** 🍂 **Harvest Hustle** is coming! React below to get the role. '
-        content += '🗓️ **Starts 8 November at 12:00 AM GMT!** Watch the main game channel for the Join button.'
+        content += '🗓️ **8 Nov, 12:00 AM GMT → 15 Nov, 12:00 AM GMT!** 🏆 **200c + HC Box** for 1st! Watch for the Join button.'
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
         if has_banner:
@@ -557,27 +560,26 @@ class HarvestRegistrationView(discord.ui.View):
             if not registration_open(e):
                 message = 'Joining is not open yet, or the event has ended. Please use the official registration post.'
             elif player(interaction.user.id):
-                message = '🌾 You are already registered! Farming begins on 8 November at 00:00 GMT.'
+                message = ('🌾 You have already joined! Open `/harvest farm` to play now.' if active(e) else '🌾 You have already joined! Farming opens 8 November at 00:00 GMT.')
             else:
                 con.execute('INSERT INTO players(user_id,joined_ts,action_window) VALUES(?,?,?)',
                             (interaction.user.id, int(time.time()), current_window(e)))
                 con.commit()
                 message = ('🎉 **You’re in!** Welcome to Harvest Hustle! 🌾\n'
-                           'Farming begins **8 November at 00:00 GMT**. '
-                           'You’ll start with **2,000 coins and 10 plots**. '
-                           'Use `/harvest help` for the full guide.')
+                           + ('**The farm is OPEN NOW!** Use `/harvest farm` to play. ' if active(e) else 'Farming begins **8 November at 00:00 GMT**. ')
+                           + 'You start with **2,000 coins and 10 plots**. Use `/harvest help` for the full guide.')
         await interaction.response.send_message(message, ephemeral=True)
 
 
-def registration_embed():
+def registration_embed(live_test=False):
     return discord.Embed(
-        title='🌾 Harvest Hustle — Registration Is Open!',
+        title=('🧪 Harvest Hustle — LIVE TEST' if live_test else '🌾 Harvest Hustle — Join the Competition!'),
         description=(
             '🚜 **It’s time to get farming!**\n\n'
             'Ready to grow your farm and compete for some fantastic prizes?\n\n'
             'Click **Join Harvest Hustle** below to enter the competition!\n\n'
-            '🌱 **Farming begins:** 8 November, 00:00 GMT\n'
-            '🏆 **Prizes:** 1st 200c + HC Box · 2nd 100c + HC Box · 3rd 75c + HC Box\n\n'
+            + ('🧪 **LIVE TEST IS ACTIVE — farming is available NOW!**\n' if live_test else '🌱 **Farming begins:** 8 November, 00:00 GMT\n')
+            + '🏆 **Prizes:** 1st 200c + HC Box · 2nd 100c + HC Box · 3rd 75c + HC Box\n\n'
             '📖 Want to know how it works? Use `/harvest help`.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
@@ -585,15 +587,31 @@ def registration_embed():
 
 
 @harvest.command(name='start', description='Host only: post the Join Harvest Hustle button in the game channel')
-async def start(interaction: discord.Interaction):
+async def start(interaction: discord.Interaction, live_test: bool = False):
     if not is_host(interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     async with lock:
         e = event()
+        if e is not None and e['live_test'] and not live_test:
+            await interaction.followup.send('🧪 A live test is already running. Use `/harvest reset-live-test` with confirmation before launching the official event.', ephemeral=True)
+            return
+        if live_test and int(time.time()) >= FARMING_AT:
+            await interaction.followup.send('Live testing is only available before the official 8 November start.', ephemeral=True)
+            return
+        if live_test and (con.execute('SELECT COUNT(*) FROM players').fetchone()[0] or (e and e['registration_post_id'])):
+            await interaction.followup.send('Cannot begin a fresh live test while players or a Join announcement already exist. Reset an earlier test first; never reset official player data.', ephemeral=True)
+            return
+        if live_test and e is not None and e['ended']:
+            await interaction.followup.send('This event has already ended; live testing is blocked to protect saved data.', ephemeral=True)
+            return
         if e is None:
             con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
+            con.commit()
+            e = event()
+        if live_test:
+            con.execute('UPDATE event SET start_ts=?, live_test=1, ended=0, winner_id=NULL, last_session_notice=0, midweek_sent=1 WHERE id=1', (int(time.time()),))
             con.commit()
             e = event()
         if e['ended'] or int(time.time()) >= e['start_ts'] + DURATION:
@@ -611,10 +629,10 @@ async def start(interaction: discord.Interaction):
             return
     try:
         message = await channel.send(
-            content='@everyone 🌾 **Harvest Hustle is coming!**',
-            embed=registration_embed(),
+            content=('🧪 **Harvest Hustle LIVE TEST — open now!** (No @everyone ping)' if live_test else '@everyone 🌾 **Harvest Hustle is coming!**'),
+            embed=registration_embed(live_test=live_test),
             view=HarvestRegistrationView(),
-            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+            allowed_mentions=discord.AllowedMentions(everyone=not live_test, users=False, roles=False))
     except discord.HTTPException:
         logging.exception('Unable to post join announcement')
         await interaction.followup.send('Could not post the announcement. Check channel and @everyone permissions.', ephemeral=True)
@@ -623,8 +641,46 @@ async def start(interaction: discord.Interaction):
         con.execute('UPDATE event SET registration_post_id=? WHERE id=1 AND registration_post_id IS NULL', (message.id,))
         con.commit()
     await interaction.followup.send(
-        f'🌾 Join button posted in {channel.mention}. The game begins **8 November 2026 at 00:00 GMT**. '
-        'The announcement was tagged @everyone.', ephemeral=True)
+        (f'🧪 LIVE TEST started in {channel.mention}. Players can join and use `/harvest farm` now. **Run `/harvest reset-live-test` before 8 November to wipe test progress and restore the official schedule.**' if live_test else f'🌾 Join button posted in {channel.mention}. The game begins **8 November 2026 at 00:00 GMT**.') + (' No @everyone ping was sent for the live test.' if live_test else ' The announcement was tagged @everyone.'), ephemeral=True)
+
+
+@harvest.command(name='reset-live-test', description='Host only: delete LIVE TEST farms and restore the official 8 November schedule')
+@app_commands.describe(confirm='Set to true to permanently erase all live-test farms and scores')
+async def reset_live_test(interaction: discord.Interaction, confirm: bool = False):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    if not confirm:
+        await interaction.response.send_message(
+            '⚠️ This permanently deletes all LIVE TEST player progress, crops, coins, missions and scores. '
+            'It restores the official **8 November 00:00 GMT → 15 November 00:00 GMT** event. '
+            'To proceed, run `/harvest reset-live-test` with **confirm = True**.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with lock:
+        e = event()
+        if not e or not e['live_test']:
+            await interaction.followup.send('No live test is active. Official game data was not touched.', ephemeral=True)
+            return
+        post_id = e['registration_post_id']
+        for table in ('players', 'plots', 'inventory', 'transactions', 'objective_claims', 'harvest_alerts'):
+            con.execute(f'DELETE FROM {table}')
+        con.execute('UPDATE event SET start_ts=?, live_test=0, registration_ts=NULL, registration_post_id=NULL, '
+                    'ended=0, winner_id=NULL, last_session_notice=-1, midweek_sent=0, final_sent=0 WHERE id=1',
+                    (FARMING_AT,))
+        con.commit()
+    if post_id:
+        try:
+            channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+            message = await channel.fetch_message(post_id)
+            await message.delete()
+        except (discord.HTTPException, AttributeError):
+            logging.warning('Could not remove old live-test Join post %s; its button will be inactive until a new official post is created', post_id)
+    await interaction.followup.send(
+        '✅ Live test data cleared. Official event restored: **8 November 2026, 00:00 GMT** to '
+        '**15 November 2026, 00:00 GMT**. The role panel was kept. '
+        'When ready, run `/harvest start` with **live_test = False** to post the official Join announcement.',
+        ephemeral=True)
 
 
 @harvest.command(name='farm',description='Open your private farming menu')
@@ -900,6 +956,8 @@ async def event_watcher():
     async with lock:
         e=event()
         if not e:return
+        if e['live_test']:
+            return  # No scheduled session, midweek or final-result pings during live testing.
         if e['ended'] and e['final_sent']:return
         now=int(time.time())
         notice=None
@@ -1201,7 +1259,7 @@ async def main():
                 logging.info('Scheduled game start for 8 November 2026 00:00 UTC; host posts join panel manually')
             elif (event()['start_ts'] == FARMING_AT + 24*3600 and
                   con.execute('SELECT COUNT(*) FROM players').fetchone()[0] == 0 and
-                  not event()['ended']):
+                  not event()['ended'] and not event()['live_test']):
                 con.execute('UPDATE event SET start_ts=?, registration_ts=NULL WHERE id=1', (FARMING_AT,))
                 con.commit()
                 logging.info('Migrated unused November event start to 8 November 2026 00:00 UTC')
