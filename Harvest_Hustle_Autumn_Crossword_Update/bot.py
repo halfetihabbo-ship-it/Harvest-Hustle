@@ -470,6 +470,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
 # Role panel is a permanent Discord button, restored after bot restarts.
 # Its message ID is saved so a host can update the existing panel rather than spam duplicates.
 official_con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
+official_con.execute('CREATE TABLE IF NOT EXISTS role_panel_signups(user_id INTEGER PRIMARY KEY)')
 official_con.commit()
 
 class HarvestRolePanel(discord.ui.View):
@@ -496,14 +497,48 @@ class HarvestRolePanel(discord.ui.View):
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason='Harvest Hustle self-service role panel')
+                async with lock:
+                    official_con.execute('DELETE FROM role_panel_signups WHERE user_id=?', (member.id,))
+                    official_con.commit()
+                await refresh_role_signup_count(interaction.guild)
                 await interaction.response.send_message('🍂 You have left the Harvest Hustle notification role. You can rejoin anytime.', ephemeral=True)
             else:
                 await member.add_roles(role, reason='Harvest Hustle self-service role panel')
+                async with lock:
+                    official_con.execute('INSERT OR IGNORE INTO role_panel_signups(user_id) VALUES(?)', (member.id,))
+                    official_con.commit()
+                await refresh_role_signup_count(interaction.guild)
                 await interaction.response.send_message('🌾 You now have the Harvest Hustle role! You will receive event announcement pings. Watch the main game channel for the host-posted join button.', ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message('I cannot manage that role. Please give me **Manage Roles** and move my highest role **above** the Harvest Hustle role.', ephemeral=True)
         except discord.HTTPException:
             await interaction.response.send_message('Discord could not update your role. Please try again.', ephemeral=True)
+
+
+def role_signup_count():
+    # Counts unique members who opted in using this bot's role panel.
+    return official_con.execute('SELECT COUNT(*) FROM role_panel_signups').fetchone()[0]
+
+
+async def refresh_role_signup_count(guild):
+    # Keep the same panel message; never ping members on count changes.
+    async with lock:
+        row = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
+        if not row:
+            return
+        channel = guild.get_channel(CHANNEL_ID) or bot.get_channel(CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(CHANNEL_ID)
+            except discord.HTTPException:
+                return
+        try:
+            message = await channel.fetch_message(row['message_id'])
+            # Editing an existing embed keeps its original attachment intact.
+            await message.edit(embed=role_panel_embed(with_banner=PANEL_BANNER.is_file()),
+                               view=HarvestRolePanel())
+        except discord.HTTPException:
+            logging.exception('Could not refresh Harvest Hustle sign-up counter')
 
 
 def role_panel_embed(with_banner=True):
