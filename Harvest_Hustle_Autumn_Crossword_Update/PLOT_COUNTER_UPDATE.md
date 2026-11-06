@@ -1,0 +1,1 @@
+Farm view now displays Plots Owned: 8/12 through 12/12, plus occupied and empty counts. Extra Plot purchase confirmation also shows the updated owned counter. Maximum of four additional plots remains enforced.
