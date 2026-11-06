@@ -67,6 +67,7 @@ def add_column(table, column, definition):
 add_column('event','registration_ts','INTEGER')
 add_column('event','live_test','INTEGER NOT NULL DEFAULT 0')
 add_column('event','registration_post_id','INTEGER')
+add_column('event','registration_channel_id','INTEGER')
 add_column('event','last_session_notice','INTEGER NOT NULL DEFAULT -1')
 add_column('event','midweek_sent','INTEGER NOT NULL DEFAULT 0')
 add_column('event','final_sent','INTEGER NOT NULL DEFAULT 0')
@@ -259,7 +260,7 @@ class CropSelect(discord.ui.Select):
             if not active(e):
                 msg='The event is not currently active.'
             elif not player(uid):
-                msg='Join the game using the registration button in the main game channel.'
+                msg='Join the game using the Join Harvest Hustle button in the main game channel.'
             else:
                 sync_actions(uid,e)
                 p=player(uid)
@@ -382,7 +383,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
             await interaction.response.send_message(msg,ephemeral=True)
             return
         if not player(uid):
-            await interaction.response.send_message('Use the Join Harvest Hustle button in the registration announcement first.',ephemeral=True)
+            await interaction.response.send_message('Use the Join Harvest Hustle button in the host announcement first.',ephemeral=True)
             return
         if active(e):
             sync_actions(uid,e)
@@ -557,7 +558,7 @@ class HarvestRegistrationView(discord.ui.View):
     async def register(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with lock:
             e = event()
-            if not registration_open(e):
+            if not registration_open(e) or not interaction.message or interaction.message.id != e['registration_post_id']:
                 message = 'Joining is not open yet, or the event has ended. Please use the official registration post.'
             elif player(interaction.user.id):
                 message = ('🌾 You have already joined! Open `/harvest farm` to play now.' if active(e) else '🌾 You have already joined! Farming opens 8 November at 00:00 GMT.')
@@ -586,62 +587,117 @@ def registration_embed(live_test=False):
     )
 
 
-@harvest.command(name='start', description='Host only: post the Join Harvest Hustle button in the game channel')
-async def start(interaction: discord.Interaction, live_test: bool = False):
+@harvest.command(name='start', description='Host only: post the Join Harvest Hustle button')
+@app_commands.describe(
+    live_test='True to test the real farming system before 8 November; False for the official event',
+    channel='Optional destination for a LIVE TEST (defaults to the channel where you run this command)'
+)
+async def start(interaction: discord.Interaction, live_test: bool = False,
+                channel: discord.TextChannel | None = None):
     if not is_host(interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
+    if not interaction.guild:
+        await interaction.response.send_message('Run this command in the server.', ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
+    now = int(time.time())
+    # Live tests can run in the host's test channel; official launches always use
+    # the configured EVENT_CHANNEL_ID to avoid an accidental wrong-channel ping.
+    if live_test:
+        destination = channel or interaction.channel
+        if not isinstance(destination, discord.TextChannel):
+            await interaction.followup.send('Choose a server text channel for the live test.', ephemeral=True)
+            return
+    else:
+        if channel is not None and channel.id != CHANNEL_ID:
+            await interaction.followup.send('Official announcements must use the configured EVENT_CHANNEL_ID. Do not select a different channel.', ephemeral=True)
+            return
+        destination = bot.get_channel(CHANNEL_ID)
+        if destination is None:
+            try:
+                destination = await bot.fetch_channel(CHANNEL_ID)
+            except discord.HTTPException:
+                await interaction.followup.send('Cannot access the official event channel. Check EVENT_CHANNEL_ID.', ephemeral=True)
+                return
     async with lock:
         e = event()
-        if e is not None and e['live_test'] and not live_test:
-            await interaction.followup.send('🧪 A live test is already running. Use `/harvest reset-live-test` with confirmation before launching the official event.', ephemeral=True)
+        count = con.execute('SELECT COUNT(*) FROM players').fetchone()[0]
+        if live_test:
+            if now >= FARMING_AT:
+                await interaction.followup.send('Live testing is only available before 8 November 2026, 00:00 GMT.', ephemeral=True)
+                return
+            if e and e['live_test']:
+                await interaction.followup.send('A live test is already active. Use its existing Join announcement, or reset it first.', ephemeral=True)
+                return
+            if e and e['ended']:
+                await interaction.followup.send('A completed event cannot be converted into a live test.', ephemeral=True)
+                return
+            if count:
+                await interaction.followup.send('Saved players exist and no live test is marked active. To protect their data, the bot will not start a test or erase them. Ask the host to inspect the database first.', ephemeral=True)
+                return
+            if e and e['start_ts'] != FARMING_AT:
+                await interaction.followup.send('An unexpected event schedule exists. No data was changed; inspect the event record before starting a test.', ephemeral=True)
+                return
+            # An earlier official/test-channel Join announcement with zero players
+            # is safe to supersede. Its button becomes invalid because registration
+            # checks the exact message ID against the active announcement.
+            old_post_id = e['registration_post_id'] if e else None
+            old_channel_id = e['registration_channel_id'] if e else None
+        else:
+            if e and e['live_test']:
+                await interaction.followup.send('A live test is active. Run `/harvest reset-live-test confirm: True` before the official launch.', ephemeral=True)
+                return
+            if e and e['ended']:
+                await interaction.followup.send('This event has already ended.', ephemeral=True)
+                return
+            if e and e['registration_post_id']:
+                await interaction.followup.send('An official Join announcement is already recorded. No duplicate @everyone ping was sent.', ephemeral=True)
+                return
+            if e and e['start_ts'] != FARMING_AT:
+                await interaction.followup.send('Unexpected event start time; no announcement posted. Inspect the schedule first.', ephemeral=True)
+                return
+            old_post_id = None
+            old_channel_id = None
+
+        # Only publish once checks pass. Save event state AFTER Discord accepts
+        # the message, so a posting failure cannot leave a half-started test.
+        try:
+            message = await destination.send(
+                content=('🧪 **Harvest Hustle LIVE TEST — open now!** (No @everyone ping)'
+                         if live_test else '@everyone 🌾 **Harvest Hustle is coming!**'),
+                embed=registration_embed(live_test=live_test),
+                view=HarvestRegistrationView(),
+                allowed_mentions=discord.AllowedMentions(everyone=not live_test, users=False, roles=False))
+        except discord.HTTPException:
+            logging.exception('Unable to post Join announcement')
+            await interaction.followup.send('Could not post the Join announcement. Check channel permissions.', ephemeral=True)
             return
-        if live_test and int(time.time()) >= FARMING_AT:
-            await interaction.followup.send('Live testing is only available before the official 8 November start.', ephemeral=True)
-            return
-        if live_test and (con.execute('SELECT COUNT(*) FROM players').fetchone()[0] or (e and e['registration_post_id'])):
-            await interaction.followup.send('Cannot begin a fresh live test while players or a Join announcement already exist. Reset an earlier test first; never reset official player data.', ephemeral=True)
-            return
-        if live_test and e is not None and e['ended']:
-            await interaction.followup.send('This event has already ended; live testing is blocked to protect saved data.', ephemeral=True)
-            return
+
         if e is None:
             con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
-            con.commit()
-            e = event()
         if live_test:
-            con.execute('UPDATE event SET start_ts=?, live_test=1, ended=0, winner_id=NULL, last_session_notice=0, midweek_sent=1 WHERE id=1', (int(time.time()),))
-            con.commit()
-            e = event()
-        if e['ended'] or int(time.time()) >= e['start_ts'] + DURATION:
-            await interaction.followup.send('This event has already finished.', ephemeral=True)
-            return
-        if e['registration_post_id']:
-            await interaction.followup.send('The join announcement has already been posted. No duplicate @everyone ping was sent.', ephemeral=True)
-            return
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(CHANNEL_ID)
-        except discord.HTTPException:
-            await interaction.followup.send('Could not find the configured game channel. Check EVENT_CHANNEL_ID.', ephemeral=True)
-            return
-    try:
-        message = await channel.send(
-            content=('🧪 **Harvest Hustle LIVE TEST — open now!** (No @everyone ping)' if live_test else '@everyone 🌾 **Harvest Hustle is coming!**'),
-            embed=registration_embed(live_test=live_test),
-            view=HarvestRegistrationView(),
-            allowed_mentions=discord.AllowedMentions(everyone=not live_test, users=False, roles=False))
-    except discord.HTTPException:
-        logging.exception('Unable to post join announcement')
-        await interaction.followup.send('Could not post the announcement. Check channel and @everyone permissions.', ephemeral=True)
-        return
-    async with lock:
-        con.execute('UPDATE event SET registration_post_id=? WHERE id=1 AND registration_post_id IS NULL', (message.id,))
+            con.execute("""UPDATE event SET start_ts=?, live_test=1, ended=0,
+                           winner_id=NULL, last_session_notice=0, midweek_sent=1,
+                           final_sent=0, registration_post_id=?, registration_channel_id=?
+                           WHERE id=1""", (now, message.id, destination.id))
+        else:
+            con.execute("""UPDATE event SET start_ts=?, live_test=0,
+                           registration_post_id=?, registration_channel_id=? WHERE id=1""",
+                        (FARMING_AT, message.id, destination.id))
         con.commit()
-    await interaction.followup.send(
-        (f'🧪 LIVE TEST started in {channel.mention}. Players can join and use `/harvest farm` now. **Run `/harvest reset-live-test` before 8 November to wipe test progress and restore the official schedule.**' if live_test else f'🌾 Join button posted in {channel.mention}. The game begins **8 November 2026 at 00:00 GMT**.') + (' No @everyone ping was sent for the live test.' if live_test else ' The announcement was tagged @everyone.'), ephemeral=True)
+
+    if live_test:
+        await interaction.followup.send(
+            f'🧪 **Live test started in {destination.mention}.** Players can click Join and use `/harvest farm` now. '
+            'No @everyone ping was sent. When finished, use `/harvest reset-live-test confirm: True` '
+            'to clear test progress and restore the official schedule.'
+            + (' An old, unused Join announcement was superseded; its button can no longer register players.' if old_post_id else ''),
+            ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f'🌾 **Official Join announcement posted in {destination.mention}.** Farming opens '
+            '**8 November 2026, 00:00 GMT**. The announcement tagged @everyone.', ephemeral=True)
 
 
 @harvest.command(name='reset-live-test', description='Host only: delete LIVE TEST farms and restore the official 8 November schedule')
@@ -663,18 +719,21 @@ async def reset_live_test(interaction: discord.Interaction, confirm: bool = Fals
             await interaction.followup.send('No live test is active. Official game data was not touched.', ephemeral=True)
             return
         post_id = e['registration_post_id']
+        post_channel_id = e['registration_channel_id']
         for table in ('players', 'plots', 'inventory', 'transactions', 'objective_claims', 'harvest_alerts'):
             con.execute(f'DELETE FROM {table}')
         con.execute('UPDATE event SET start_ts=?, live_test=0, registration_ts=NULL, registration_post_id=NULL, '
-                    'ended=0, winner_id=NULL, last_session_notice=-1, midweek_sent=0, final_sent=0 WHERE id=1',
+                    'ended=0, winner_id=NULL, last_session_notice=-1, midweek_sent=0, final_sent=0, registration_channel_id=NULL WHERE id=1',
                     (FARMING_AT,))
         con.commit()
     if post_id:
         try:
-            channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+            if not post_channel_id:
+                raise ValueError('Old test announcement channel was not recorded')
+            channel = bot.get_channel(post_channel_id) or await bot.fetch_channel(post_channel_id)
             message = await channel.fetch_message(post_id)
             await message.delete()
-        except (discord.HTTPException, AttributeError):
+        except (discord.HTTPException, AttributeError, ValueError):
             logging.warning('Could not remove old live-test Join post %s; its button will be inactive until a new official post is created', post_id)
     await interaction.followup.send(
         '✅ Live test data cleared. Official event restored: **8 November 2026, 00:00 GMT** to '
@@ -705,7 +764,7 @@ async def leaderboard(interaction:discord.Interaction):
 async def rules(interaction:discord.Interaction):
     crops='\n'.join(f"{v['name']}: seed {v['cost']}c → sells {v['sale']}c · grows {v['hours']} hours" for v in CROPS.values())
     e=make_embed('📖 Harvest Hustle Rules',
-        '**Registration opens 24 hours before farming begins. No late joins.** Seven days, fourteen 12-hour sessions. You get **10 planting actions per session**; unused actions do not roll over. Each player starts with **2,000 coins and 10 plots**.\n\n'
+        '**Join using the host-posted Join button; late joining is allowed while the event is active.** Seven days, fourteen 12-hour sessions. You get **10 planting actions per session**; unused actions do not roll over. Each player starts with **2,000 coins and 10 plots**.\n\n'
         '**Plant**: one planting action and the seed cost per plot. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
