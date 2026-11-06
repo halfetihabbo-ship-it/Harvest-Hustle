@@ -706,20 +706,10 @@ async def on_ready():
 
 async def main():
     async with bot:
-        await bot.login(TOKEN)
-
         guild = discord.Object(id=GUILD_ID)
+        await bot.tree.sync(guild=guild)
+        await bot.start(TOKEN)
 
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-
-        print(f"Successfully synced {len(synced)} slash commands.")
-
-        await bot.connect(reconnect=True)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
+asyncio.run(main())
 if __name__=='__main__':
     asyncio.run(main())
