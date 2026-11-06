@@ -1255,7 +1255,7 @@ class HarvestTestView(discord.ui.View):
                            f'**Day {self.test_hour // 24 + 1} · Session {self.test_hour // 12 % 2 + 1}** (of 14) · Hour {self.test_hour}/168\n'
                            f'**Coins:** {self.coins:,} · **Farm value:** {self.value():,}\n'
                            f'**Planting actions:** {self.actions}/{PLOTS + self.extra_plot} used\n'
-                           f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
+                           f'**Plots:** {PLOTS + self.extra_plot}/20 · **Market stalls:** {self.market}\n'
                            f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n'
                            f'**Missions completed:** {self.missions_completed}\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n**Today’s missions**\n' + self.mission_status() + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
