@@ -213,6 +213,31 @@ class FarmView(discord.ui.View):
     async def refresh(self,interaction,button):
         await show_farm(interaction)
 
+    @discord.ui.button(label='Save Farm to DMs', emoji='📩', style=discord.ButtonStyle.secondary, row=3)
+    async def save_farm(self, interaction, button):
+        # The game channel remains ephemeral; this is an optional lasting copy.
+        async with lock:
+            e=event()
+            p=player(self.uid)
+            if not e or not p:
+                await interaction.response.send_message('Join the game first.', ephemeral=True)
+                return
+            coins=p['coins']
+            value=farm_value(self.uid,p,e)
+            inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in
+                          con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(self.uid,))) or 'Empty'
+            ready=sum(1 for r in con.execute('SELECT * FROM plots WHERE user_id=?',(self.uid,))
+                      if crop_ready_ts(r,e)<=int(time.time()))
+            msg=make_embed('🍁 Your Harvest Hustle Farm — Saved Copy',
+                f'**Coins:** {coins:,}c\n**Farm value:** {value:,}c\n'
+                f'**Plots:** {available_plots(p)}/20\n**Crops ready:** {ready}\n'
+                f'**Inventory:** {inv}\n\nOpen `/harvest farm` in the game channel to play.')
+        try:
+            await interaction.user.send(embed=msg)
+            await interaction.response.send_message('📩 A lasting copy of your farm summary was sent to your DMs.', ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message('Could not send a DM. Check your server DM privacy settings.', ephemeral=True)
+
     @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=2)
     async def close(self, interaction, button):
         # Explicitly dismiss only this private farm panel when the player chooses.
@@ -620,20 +645,23 @@ async def rules(interaction:discord.Interaction):
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
         '**Winner**: coins + stored produce sale value + upgrade resale value. **Growing crops are worth 0 at closing.** Tie order: lifetime sales, total crops harvested, earlier join, then Discord user ID.\n\n'
-        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+30c), harvest 2 crops (+50c), sell once (+70c); claim with `/harvest objectives` each event day. No random crop failures, market price swings or speed bonuses. Players join using the host-posted button; there is no separate registration countdown. All progress is stored in SQLite.')
+        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+50c), harvest 2 crops (+75c), sell once (+100c), plus a +75c completion bonus; claim with `/harvest objectives` each event day. No random crop failures, market price swings or speed bonuses. Players join using the host-posted button; there is no separate registration countdown. All progress is stored in SQLite.')
     await interaction.response.send_message(embed=e,ephemeral=True)
 
 @harvest.command(name='help', description='Complete guide to Harvest Hustle, commands, missions and prizes')
 async def harvest_help(interaction: discord.Interaction):
     intro = make_embed('🌾 Harvest Hustle | How to Play',
-        '**Goal:** Build the highest-value farm over **7 days**. The host posts the join button manually; farming starts **8 November 2026 at 00:00 GMT**. There is no separate registration period.\n\n'
+        '**Goal:** Build the highest-value farm over **7 days**, starting **8 November 2026 at 00:00 GMT**.\n\n'
+        '**Joining the event**\n'
+        'First, react to the original role panel to access the event channels. Then, when the host posts the separate **Join Harvest Hustle** announcement in the main game channel, click its **Join** button. **No join slash command and no 24-hour registration wait.**\n\n'
         '**Getting started**\n'
-        '1. Click **Join Harvest Hustle** in the host announcement in the main game channel.\n'
+        '1. Click the **Join Harvest Hustle** button in the host announcement.\n'
         '2. Once farming begins, use `/harvest farm` to open your private controls.\n'
         '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**.\n'
         '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
         '5. Click **Sell Produce** to sell everything in your inventory for coins. Harvesting and selling are **free actions**.\n\n'
         '**Starting resources:** 2,000 in-game coins, 10 plots and **10 planting actions per 12-hour session**. Unused actions do not carry over. Crops grow in real time, independent of action resets.\n\n'
+        '**Private updates:** Farm actions appear privately in the game channel. Discord controls how long ephemeral messages stay visible. Use **Save Farm to DMs** for a lasting copy.\n\n'
         '**Crop readiness:** The bot displays relative ready times and attempts to DM you when crops mature. If DMs are disabled, check `/harvest farm` yourself. Ready crops remain available until harvested.')
     crops = '\n'.join(f"{v['name']} — **{v['hours']}h** · Seed **{v['cost']}c** · Sell **{v['sale']}c**" for v in CROPS.values())
     economy = make_embed('🌱 Crops, Upgrades & Daily Missions',
@@ -642,10 +670,11 @@ async def harvest_help(interaction: discord.Interaction):
         '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space, not an extra planting action. Resale value: **50% of purchase price**.\n'
         '🛒 Market Stall: **1,200c** per level, up to **2 levels**. Each level increases produce sale prices by **6%** (maximum +12%). Resale value: **600c** per level.\n\n'
         '**Three daily missions** (claim via `/harvest objectives`)\n'
-        '• Plant 2 crops: **+30c**\n'
-        '• Harvest 2 crops: **+50c**\n'
-        '• Sell produce at least once: **+70c**\n'
-        'Missions reset each event day. Open objectives to claim earned rewards **before the next day**. Maximum **150c per day**. Harvest milestones (5/15/30/50) are recognition-only.')
+        '• Plant 2 crops: **+50c**\n'
+        '• Harvest 2 crops: **+75c**\n'
+        '• Sell produce at least once: **+100c**\n'
+        '• Complete all three: **+75c daily bonus**\n'
+        'Missions reset each event day. Open objectives to claim earned rewards **before the next day**. Maximum **300c per day** (2,100c over seven days). Harvest milestones (5/15/30/50) are recognition-only.')
     finish = make_embed('🏆 Winning, Prizes & Commands',
         '**Final farm value** = remaining coins + harvested produce still in inventory at its current sale value + upgrade resale value. **Unharvested crops are worth 0 at event closing.**\n'
         'Ties: lifetime produce sales → crops harvested → earlier registration → Discord user ID.\n\n'
@@ -659,14 +688,6 @@ async def harvest_help(interaction: discord.Interaction):
         '`/harvest leaderboard` — Rankings\n'
         '`/harvest stats` — Your farm statistics\n'
         '`/harvest status` — Event schedule\n\n'
-        '**Host-only commands**\n'
-        '`/harvest role-panel` — Post or refresh the role panel\n'
-        '`/harvest start` — Host: post the @everyone join announcement and button\n'
-        '`/harvest dashboard` — View activity and standings\n'
-        '`/harvest history` — Review player transactions\n'
-        '`/harvest adjust-coins` — Adjust a player’s coins\n'
-        '`/harvest test` — Private practice farm; actions open new private results, and Send Test DM checks alerts\n'
-        '`/harvest reset` — Reset a completed event.\n\n'
         '**Fair play:** No random crop failures, market price swings or speed bonuses. All coin amounts above are **in-game coins** unless explicitly described as Habbo credits.')
     await interaction.response.send_message(embeds=[intro, economy, finish], ephemeral=True)
 
@@ -712,9 +733,9 @@ async def send_announcement(message,ping=False):
 # Three achievable missions per event day, claimable via /harvest objectives or
 # the Daily Missions farm button. Rewards are modest, deterministic and once/day.
 DAILY_MISSIONS = (
-    ('first_seed', 'Plant at least 2 crops', 'plant', 2, 30),
-    ('harvest', 'Harvest at least 2 crops', 'harvest', 2, 50),
-    ('trade', 'Sell produce at least once', 'sell', 1, 70),
+    ('first_seed', 'Plant at least 2 crops', 'plant', 2, 50),
+    ('harvest', 'Harvest at least 2 crops', 'harvest', 2, 75),
+    ('trade', 'Sell produce at least once', 'sell', 1, 100),
 )
 
 async def show_objectives(interaction):
@@ -742,10 +763,25 @@ async def show_objectives(interaction):
                 earned+=reward
             done=counts[action]>=target
             lines.append(f'{"✅" if done else "⬜"} **{label}** — {min(counts[action],target)}/{target} · **+{reward}c**' + (' (claimed)' if done else ''))
+        # The completion bonus is claimed once per event day, only after all 3
+        # mission targets have been achieved. A unique DB key prevents duplicates.
+        all_done=all(counts[action]>=target for _,_,action,target,_ in DAILY_MISSIONS)
+        bonus_claimed=con.execute('SELECT 1 FROM objective_claims WHERE user_id=? AND day=? AND objective=?',
+                                  (uid,day,'daily_bonus')).fetchone()
+        if all_done and not bonus_claimed:
+            cur=con.execute('INSERT OR IGNORE INTO objective_claims VALUES(?,?,?)',
+                            (uid,day,'daily_bonus'))
+            if cur.rowcount:
+                con.execute('UPDATE players SET coins=coins+75 WHERE user_id=?',(uid,))
+                log_action(uid,e,'mission','daily_bonus',75)
+                earned+=75
+        lines.append(('✅' if all_done else '⬜') + ' **Complete all three missions** — ' +
+                     ('3/3' if all_done else f'{sum(counts[action]>=target for _,_,action,target,_ in DAILY_MISSIONS)}/3') +
+                     ' · **+75c bonus**' + (' (claimed)' if all_done else ''))
         con.execute('UPDATE players SET objectives_claimed=(SELECT COUNT(*) FROM objective_claims WHERE user_id=?) WHERE user_id=?',(uid,uid))
-        total=con.execute('SELECT COUNT(*) FROM objective_claims WHERE user_id=?',(uid,)).fetchone()[0]
+        total=con.execute("SELECT COUNT(*) FROM objective_claims WHERE user_id=? AND objective!='daily_bonus'",(uid,)).fetchone()[0]
         con.commit()
-    message='\n'.join(lines)+f'\n\n🏅 **Missions completed:** {total} · **Rewards claimed now:** +{earned} coins\nClaim missions before the next event day begins. Rewards are once per mission per day.'
+    message='\n'.join(lines)+f'\n\n🏅 **Missions completed:** {total} · **Rewards claimed now:** +{earned} coins\nMaximum **300c per day** including the completion bonus. Claim before the next event day. Rewards are once per mission per day.'
     await interaction.response.send_message(embed=make_embed(f'🎯 Day {day+1} Daily Missions',message),ephemeral=True)
 
 @harvest.command(name='objectives',description='View and claim achievable daily farming missions')
@@ -989,8 +1025,7 @@ class HarvestTestView(discord.ui.View):
     async def refresh(self, interaction, notice):
         # Acknowledge without editing/deleting the current ephemeral message.
         # Discord controls how long ephemeral posts remain visible; never auto-delete them.
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(embed=action_embed(notice, 'info'), ephemeral=True)
+        await interaction.response.send_message(embed=action_embed(notice, 'info'), ephemeral=True)
         await interaction.followup.send(embed=self.summary(), view=self, ephemeral=True)
 
     @discord.ui.select(placeholder='🧪 Plant a test crop', row=0,
@@ -1096,6 +1131,14 @@ class HarvestTestView(discord.ui.View):
             logging.info('Could not send test harvest DM to %s: %s', interaction.user.id, exc)
             msg='⚠️ Could not deliver the test DM. Check your Discord DM privacy settings and try again.'
         await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Save Farm to DMs', emoji='📩', style=discord.ButtonStyle.secondary, row=4)
+    async def save_test(self, interaction, button):
+        try:
+            await interaction.user.send(embed=self.summary())
+            await interaction.response.send_message('📩 A copy of your test farm was sent to your DMs, where it will remain available.', ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message('I could not send a DM. Please enable server DMs for the bot.', ephemeral=True)
 
     @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=3)
     async def close_test(self, interaction, button):
