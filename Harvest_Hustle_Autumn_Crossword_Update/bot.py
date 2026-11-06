@@ -180,7 +180,7 @@ def is_host(interaction):
 
 class FarmView(discord.ui.View):
     def __init__(self, uid):
-        super().__init__(timeout=300)
+        super().__init__(timeout=1800)
         self.uid=uid
 
     async def interaction_check(self, interaction):
@@ -212,6 +212,12 @@ class FarmView(discord.ui.View):
     @discord.ui.button(label='Refresh Farm',emoji='🔄',style=discord.ButtonStyle.secondary,row=1)
     async def refresh(self,interaction,button):
         await show_farm(interaction)
+
+    @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=2)
+    async def close(self, interaction, button):
+        # Explicitly dismiss only this private farm panel when the player chooses.
+        await interaction.response.edit_message(view=None)
+        self.stop()
 
 class CropSelect(discord.ui.Select):
     def __init__(self):
@@ -981,9 +987,9 @@ class HarvestTestView(discord.ui.View):
         return embed
 
     async def refresh(self, interaction, notice):
-        # Each test action creates a fresh, private result with updated controls.
-        # Remove controls from the previous message to avoid stale menus.
-        await interaction.response.edit_message(view=None)
+        # Acknowledge without editing/deleting the current ephemeral message.
+        # Discord controls how long ephemeral posts remain visible; never auto-delete them.
+        await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(embed=action_embed(notice, 'info'), ephemeral=True)
         await interaction.followup.send(embed=self.summary(), view=self, ephemeral=True)
 
@@ -1090,6 +1096,11 @@ class HarvestTestView(discord.ui.View):
             logging.info('Could not send test harvest DM to %s: %s', interaction.user.id, exc)
             msg='⚠️ Could not deliver the test DM. Check your Discord DM privacy settings and try again.'
         await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=3)
+    async def close_test(self, interaction, button):
+        await interaction.response.edit_message(view=None)
+        self.stop()
 
     @discord.ui.button(label='Reset Test', emoji='🔄', style=discord.ButtonStyle.danger, row=2)
     async def reset_test(self, interaction, button):
