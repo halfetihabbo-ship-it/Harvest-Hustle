@@ -393,44 +393,25 @@ class HarvestRolePanel(discord.ui.View):
 
 def role_panel_embed(with_banner=True):
     embed = discord.Embed(
-        title='🍁 HARVEST HUSTLE | 7-DAY FARMING CHAMPIONSHIP',
+        title='🍂 Harvest Hustle | 7-Day Farming Event',
         description=(
-            '🌾 **Grow crops, earn coins and build the most valuable farm!**\n'
-            'Press **Join / Leave Harvest Hustle** below to receive event announcements. '
-            'The role is **not** game registration: when registration opens, use `/harvest join`.\n\n'
-            '**🌱 YOUR FARM**\n'
-            '• Start with **2,000 in-game coins** and **10 plots**; expand to **20 plots**.\n'
-            '• **10 planting actions** reset every **12 hours**. Harvesting and selling are free.\n'
-            '• Crops grow in real time. The bot DMs you when they are ready: open '
-            '`/harvest farm`, tap **Harvest Ready**, then **Sell Produce**.\n'
-            '• **Daily missions:** Plant 2 crops (+30), harvest 2 (+50), sell once (+70). '
-            'Claim via `/harvest objectives` for up to **150 coins/day**.\n\n'
-            '**🥕 CROPS — Seed → Sale · Growing time**\n'
-            '🥕 Carrots: **80 → 230** · **2h**\n'
-            '🌽 Corn: **130 → 320** · **4h**\n'
-            '🍎 Apples: **200 → 440** · **6h**\n'
-            '🎃 Pumpkins: **250 → 540** · **8h**\n'
-            '🍂 Golden Gourds: **250 → 500** · **12h**\n\n'
-            '**🏡 FARM UPGRADES**\n'
-            '• Extra plots **11–14: 500** each; **15–17: 900** each; **18–20: 1,500** each.\n'
-            '• Market Stall: **1,200** per level, **+6%** sale value per level, maximum **2 levels**.\n\n'
-            '**🏆 PRIZES**\n'
-            '🥇 **1st:** 200 Habbo credits + HC Box\n'
-            '🥈 **2nd:** 100 Habbo credits + HC Box\n'
-            '🥉 **3rd:** 75 Habbo credits + HC Box\n\n'
-            '**🏅 HOW TO WIN**\n'
-            'After seven days, the **highest final farm value** wins: '
-            '**coins + harvested inventory value + upgrade resale value**. '
-            'Growing/unharvested crops count as **zero**. Ties: lifetime sales, '
-            'harvest count, earliest registration, then Discord ID.\n\n'
-            '**📖 COMMANDS:** `/harvest join` · `/harvest farm` · '
-            '`/harvest objectives` · `/harvest leaderboard` · `/harvest help`'
+            '🎮 **It’s time for another Discord game!**\n\n'
+            '🚜 **Ready to get your farming boots on?**\n\n'
+            'Plant, grow and harvest your way to the top! Build your farm, '
+            'earn coins and compete with fellow farmers for some lovely prizes. 🌾\n\n'
+            '**🏆 Prizes**\n'
+            '🥇 **1st Place:** 200c + HC Box\n'
+            '🥈 **2nd Place:** 100c + HC Box\n'
+            '🥉 **3rd Place:** 75c + HC Box\n\n'
+            '🌻 **React below to get the role** and stay updated with event announcements and reminders!\n\n'
+            '📖 Want the full details? Check `/harvest help`.\n'
+            '🌱 When registration opens, join the game using `/harvest join`.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
     )
     if with_banner:
         embed.set_image(url='attachment://harvest_hustle_role_banner.png')
-    embed.set_footer(text='7 days of farming • Event role notifications ≠ game registration')
+    embed.set_footer(text='A little farming, a little competition, and lots of fun!')
     return embed
 
 intents=discord.Intents.default()
@@ -472,7 +453,7 @@ async def role_panel(interaction: discord.Interaction):
             except discord.NotFound:
                 pass
         # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
-        content = '@everyone 🍁 **Harvest Hustle is here!** Claim the event role below for announcements. '
+        content = '@everyone 🎮 **It’s time for another Discord game!** 🍂 **Harvest Hustle** is coming! React below to get the role. '
         content += 'When registration opens, enter with `/harvest join`!'
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
@@ -581,13 +562,19 @@ async def harvest_help(interaction: discord.Interaction):
         '`/harvest help` — This guide\n'
         '`/harvest rules` — Rules summary\n'
         '`/harvest join` — Register\n'
-        '`/harvest farm` — Plant, harvest, sell and buy upgrades\n'
-        '`/harvest objectives` — View and claim daily missions\n'
+        '`/harvest farm` — Open your farm; use **Plant**, **Harvest Ready**, **Sell Produce**, **Upgrades** and **Refresh Farm** buttons\n'
+        '`/harvest objectives` — View and claim daily missions (claim before the next event day)\n'
         '`/harvest leaderboard` — Rankings\n'
         '`/harvest stats` — Your farm statistics\n'
         '`/harvest status` — Event schedule\n\n'
         '**Host-only commands**\n'
-        '`/harvest role-panel`, `/harvest start`, `/harvest dashboard`, `/harvest history`, `/harvest adjust-coins`, `/harvest test`, `/harvest reset`.\n\n'
+        '`/harvest role-panel` — Post or refresh the role panel\n'
+        '`/harvest start` — Open registration and schedule the game\n'
+        '`/harvest dashboard` — View activity and standings\n'
+        '`/harvest history` — Review player transactions\n'
+        '`/harvest adjust-coins` — Adjust a player’s coins\n'
+        '`/harvest test` — Try a private practice farm\n'
+        '`/harvest reset` — Reset a completed event.\n\n'
         '**Fair play:** No random crop failures, market price swings or speed bonuses. All coin amounts above are **in-game coins** unless explicitly described as Habbo credits.')
     await interaction.response.send_message(embeds=[intro, economy, finish], ephemeral=True)
 
