@@ -712,6 +712,152 @@ async def before_watcher():
 async def on_ready():
     logging.info('Logged in as %s',bot.user)
 
+
+# Host-only sandbox. This is deliberately separate from the live event and SQLite.
+# All state lives in this private Discord view; no event, player or leaderboard data is touched.
+class HarvestTestView(discord.ui.View):
+    def __init__(self, host_id):
+        super().__init__(timeout=1800)
+        self.host_id = host_id
+        self.session = 0
+        self.coins = START_COINS
+        self.plots = {}
+        self.inventory = {crop: 0 for crop in CROPS}
+        self.actions = 0
+        self.extra_plot = 0
+        self.market = 0
+        self.planted = 0
+        self.harvested = 0
+        self.sold = 0
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.host_id:
+            await interaction.response.send_message('Only the host who opened this sandbox can use it.', ephemeral=True)
+            return False
+        return True
+
+    def value(self):
+        return (self.coins + sum(int(qty * CROPS[k]['sale'] * (1 + self.market * 0.06))
+                   for k, qty in self.inventory.items())
+                + self.extra_plot * UPGRADES['extra_plot']['resale']
+                + self.market * UPGRADES['market']['resale'])
+
+    def summary(self):
+        lines = []
+        for slot in range(1, PLOTS + self.extra_plot + 1):
+            if slot not in self.plots:
+                lines.append(f'{slot}. Empty')
+            else:
+                crop, planted_session = self.plots[slot]
+                left = max(0, CROPS[crop]['windows'] - (self.session - planted_session))
+                lines.append(f'{slot}. {CROPS[crop]["name"]} — ' + ('Ready!' if not left else f'{left} session(s) left'))
+        inv = ', '.join(f'{CROPS[k]["name"]} x{qty}' for k, qty in self.inventory.items() if qty) or 'Empty'
+        embed = make_embed('🧪 Harvest Hustle — PRIVATE TEST SANDBOX',
+                           f'**Day {self.session // 2 + 1} · Session {self.session % 2 + 1}** (of 14)\n'
+                           f'**Coins:** {self.coins:,} · **Farm value:** {self.value():,}\n'
+                           f'**Planting actions:** {self.actions}/{ACTIONS} used\n'
+                           f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
+                           f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales:** {self.sold:,}\n\n'
+                           '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv)
+        embed.set_footer(text='TEST ONLY · No real coins, event records, announcements or leaderboard changes')
+        return embed
+
+    async def refresh(self, interaction, notice):
+        await interaction.response.edit_message(content=notice, embed=self.summary(), view=self)
+
+    @discord.ui.select(placeholder='🧪 Plant a test crop', row=0,
+                       options=[discord.SelectOption(label=v['name'], value=k,
+                                  description=f'Seed {v["cost"]}c · {v["windows"]} sessions · sells {v["sale"]}c')
+                                for k, v in CROPS.items()])
+    async def plant_test(self, interaction, select):
+        crop = select.values[0]
+        cfg = CROPS[crop]
+        free = next((i for i in range(1, PLOTS + self.extra_plot + 1) if i not in self.plots), None)
+        if self.session >= 14:
+            msg = 'Test has ended. Reset to start again.'
+        elif self.actions >= ACTIONS:
+            msg = 'No planting actions left; advance to the next session.'
+        elif free is None:
+            msg = 'All plots are occupied. Harvest mature crops first.'
+        elif self.coins < cfg['cost']:
+            msg = 'Not enough test coins.'
+        else:
+            self.plots[free] = (crop, self.session)
+            self.coins -= cfg['cost']
+            self.actions += 1
+            self.planted += 1
+            msg = f'Planted {cfg["name"]} in plot {free}.'
+        await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Harvest Ready', emoji='🧺', style=discord.ButtonStyle.success, row=1)
+    async def harvest_test(self, interaction, button):
+        ready = [(slot, crop) for slot, (crop, planted) in self.plots.items()
+                 if self.session - planted >= CROPS[crop]['windows']]
+        for slot, crop in ready:
+            self.inventory[crop] += 1
+            del self.plots[slot]
+        self.harvested += len(ready)
+        await self.refresh(interaction, f'Harvested {len(ready)} ready crop(s).')
+
+    @discord.ui.button(label='Sell Produce', emoji='🪙', style=discord.ButtonStyle.primary, row=1)
+    async def sell_test(self, interaction, button):
+        earned = sum(int(qty * CROPS[k]['sale'] * (1 + self.market * 0.06))
+                     for k, qty in self.inventory.items())
+        self.coins += earned
+        self.sold += earned
+        self.inventory = {crop: 0 for crop in CROPS}
+        await self.refresh(interaction, f'Sold stored produce for {earned:,} test coins.')
+
+    @discord.ui.button(label='Next Session', emoji='⏩', style=discord.ButtonStyle.secondary, row=1)
+    async def next_test(self, interaction, button):
+        if self.session < 13:
+            self.session += 1
+            self.actions = 0
+            msg = f'Advanced to session {self.session + 1}; planting actions refreshed.'
+        else:
+            self.session = 14
+            msg = f'Test finished! Final farm value: {self.value():,}. Unharvested crops count for zero.'
+        await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Buy Plot (500c)', emoji='🌱', style=discord.ButtonStyle.secondary, row=2)
+    async def plot_test(self, interaction, button):
+        if self.extra_plot >= 4:
+            msg = 'Maximum extra plots reached.'
+        elif self.coins < 500:
+            msg = 'Not enough test coins.'
+        else:
+            self.coins -= 500
+            self.extra_plot += 1
+            msg = 'Purchased an extra test plot.'
+        await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Buy Stall (800c)', emoji='🛒', style=discord.ButtonStyle.secondary, row=2)
+    async def market_test(self, interaction, button):
+        if self.market >= 2:
+            msg = 'Maximum market stalls reached.'
+        elif self.coins < 800:
+            msg = 'Not enough test coins.'
+        else:
+            self.coins -= 800
+            self.market += 1
+            msg = 'Purchased a market stall (+6% sale value).'
+        await self.refresh(interaction, msg)
+
+    @discord.ui.button(label='Reset Test', emoji='🔄', style=discord.ButtonStyle.danger, row=2)
+    async def reset_test(self, interaction, button):
+        self.__init__(self.host_id)
+        await self.refresh(interaction, 'Test sandbox reset to the starting farm.')
+
+
+@harvest.command(name='test', description='Host only: try farming in a private sandbox without affecting the live game')
+async def harvest_test(interaction: discord.Interaction):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    view = HarvestTestView(interaction.user.id)
+    await interaction.response.send_message('Plant crops, advance sessions, harvest, sell and upgrade. This is a separate test farm.',
+                                            embed=view.summary(), view=view, ephemeral=True)
+
 bot.tree.add_command(harvest)
 
 logging.info("RUNNING FILE: %s", __file__)
