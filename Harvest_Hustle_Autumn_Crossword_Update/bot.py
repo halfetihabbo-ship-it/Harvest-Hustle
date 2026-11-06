@@ -19,7 +19,6 @@ CHANNEL_ID = int(os.environ.get('EVENT_CHANNEL_ID', '1567980502965551144'))
 ROLE_PANEL_CHANNEL_ID = int(os.environ.get('ROLE_PANEL_CHANNEL_ID', str(CHANNEL_ID)))
 ROLE_ID = int(os.environ.get('EVENT_ROLE_ID', '1567982021106602065'))
 DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
-PANEL_BANNER = Path(__file__).with_name('harvest_hustle_role_banner.png')
 WINDOW = 12 * 3600
 DURATION = 14 * WINDOW
 FARMING_AT = int(datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc).timestamp())
@@ -485,7 +484,7 @@ def role_signup_count(guild: discord.Guild) -> int:
     return len(role.members) if role else 0
 
 
-def role_panel_embed(signups: int, with_banner: bool = True):
+def role_panel_embed(signups: int, with_banner: bool = False):
     embed = discord.Embed(
         title='🍂 HARVEST HUSTLE | AUTUMN SHOWDOWN',
         description=(
@@ -521,8 +520,6 @@ def role_panel_embed(signups: int, with_banner: bool = True):
             '🏆 Climb the leaderboard over seven days'
         ), inline=False,
     )
-    if with_banner:
-        embed.set_image(url='attachment://harvest_hustle_role_banner.png')
     embed.set_footer(text='🌻 7 DAYS • 3 WINNERS • 1 HARVEST CHAMPION')
     return embed
 
@@ -536,8 +533,7 @@ async def refresh_role_panel_counts(guild: discord.Guild):
             continue
         try:
             message = await channel.fetch_message(record['message_id'])
-            has_banner = bool(message.embeds and message.embeds[0].image and message.embeds[0].image.url)
-            await message.edit(embed=role_panel_embed(count, with_banner=has_banner))
+            await message.edit(embed=role_panel_embed(count))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             continue
 
@@ -617,19 +613,13 @@ async def role_panel(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        # Always post a fresh, visible panel. Never edit a previously posted message.
-        # Only the first role panel tags @everyone; subsequent posts stay quiet.
-        previous = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
-        has_banner = PANEL_BANNER.is_file()
-        mention_everyone = previous is None
-        content = ('@everyone ' if mention_everyone else '') + (
+        # Always post a fresh role panel without a banner or mass mention.
+        content = (
             '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
             '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
             '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
-        kwargs = dict(content=content, embed=role_panel_embed(role_signup_count(interaction.guild), with_banner=has_banner),
-                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=mention_everyone, roles=False, users=False))
-        if has_banner:
-            kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
+        kwargs = dict(content=content, embed=role_panel_embed(role_signup_count(interaction.guild)),
+                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions.none())
         message = await channel.send(**kwargs)
         official_con.execute('INSERT INTO role_panel(id,message_id) VALUES(1,?) '
                     'ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id', (message.id,))
@@ -637,10 +627,10 @@ async def role_panel(interaction: discord.Interaction):
         official_con.execute('INSERT OR REPLACE INTO role_panel_messages(message_id, channel_id) VALUES(?, ?)', (message.id, channel.id))
         official_con.commit()
         await interaction.followup.send(
-            f'🍂 A NEW role panel was posted in {channel.mention}. ' + ('@everyone was included.' if mention_everyone else 'No repeat @everyone ping was sent.'), ephemeral=True)
+            f'🍂 A NEW role panel was posted in {channel.mention}. No mass mention was sent.', ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
-            'I need View Channel, Send Messages, Embed Links and Attach Files in the role-panel channel.', ephemeral=True)
+            'I need View Channel, Send Messages and Embed Links in the role-panel channel.', ephemeral=True)
     except discord.HTTPException:
         await interaction.followup.send('Discord could not post the role panel. Please retry.', ephemeral=True)
 
@@ -660,15 +650,12 @@ async def role_panel_test(interaction: discord.Interaction):
     try:
         # This command ignores ROLE_PANEL_CHANNEL_ID and EVENT_CHANNEL_ID.
         # No @everyone ping, no game launch, and no modification of the official panel.
-        has_banner = PANEL_BANNER.is_file()
         kwargs = dict(
             content='🍂 **HARVEST HUSTLE — ROLE PANEL PREVIEW** 🚜',
-            embed=role_panel_embed(role_signup_count(interaction.guild), with_banner=has_banner),
+            embed=role_panel_embed(role_signup_count(interaction.guild)),
             view=HarvestRolePanel(),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        if has_banner:
-            kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await interaction.channel.send(**kwargs)
         # Register this preview so its sign-up counter also updates live.
         official_con.execute(
@@ -682,7 +669,7 @@ async def role_panel_test(interaction: discord.Interaction):
         )
     except discord.Forbidden:
         await interaction.followup.send(
-            'I need View Channel, Send Messages, Embed Links and Attach Files in this channel.',
+            'I need View Channel, Send Messages and Embed Links in this channel.',
             ephemeral=True,
         )
     except discord.HTTPException:
