@@ -93,6 +93,48 @@ con.execute('''CREATE TABLE IF NOT EXISTS harvest_alerts (
 )''')
 con.commit()
 
+# Separate persistent databases: live tests never touch official player tables.
+# A one-time, backed-up cleanup is authorized for the pre-launch legacy test data.
+official_con = con
+TEST_DB_PATH = str(Path(DB_PATH).with_name(Path(DB_PATH).stem + '_test.sqlite3'))
+official_con.execute('CREATE TABLE IF NOT EXISTS harvest_runtime (id INTEGER PRIMARY KEY CHECK(id=1), mode TEXT NOT NULL)')
+official_con.execute("INSERT OR IGNORE INTO harvest_runtime(id,mode) VALUES(1,'official')")
+official_con.execute('CREATE TABLE IF NOT EXISTS harvest_migrations (name TEXT PRIMARY KEY)')
+if not official_con.execute("SELECT 1 FROM harvest_migrations WHERE name='prelaunch_cleanup_v1'").fetchone():
+    # Backup the original SQLite database before clearing legacy test players.
+    legacy_backup = str(Path(DB_PATH).with_name(Path(DB_PATH).stem + '_prelaunch_backup.sqlite3'))
+    if not Path(legacy_backup).exists():
+        backup_con = sqlite3.connect(legacy_backup)
+        official_con.backup(backup_con)
+        backup_con.close()
+    for table in ('harvest_alerts','transactions','objective_claims','inventory','plots','players','event'):
+        official_con.execute(f'DELETE FROM {table}')
+    official_con.execute("UPDATE harvest_runtime SET mode='official' WHERE id=1")
+    official_con.execute("INSERT INTO harvest_migrations(name) VALUES('prelaunch_cleanup_v1')")
+    official_con.commit()
+    logging.warning('Cleared legacy prelaunch game records; database backup saved to %s', legacy_backup)
+
+test_con = sqlite3.connect(TEST_DB_PATH, check_same_thread=False)
+test_con.row_factory = sqlite3.Row
+test_con.execute('PRAGMA journal_mode=WAL')
+test_con.execute('PRAGMA busy_timeout=5000')
+# Mirror the official schema without copying player records.
+for schema_row in official_con.execute("SELECT type,name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+    if schema_row['name'] in ('harvest_runtime', 'harvest_migrations'):
+        continue
+    test_con.execute(schema_row['sql'].replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1)) if schema_row['sql'].startswith('CREATE TABLE ') else None
+test_con.commit()
+
+def test_mode_active():
+    return official_con.execute('SELECT mode FROM harvest_runtime WHERE id=1').fetchone()['mode'] == 'test'
+
+con = test_con if test_mode_active() else official_con
+
+def clear_test_tables():
+    for table in ('harvest_alerts','transactions','objective_claims','inventory','plots','players','event'):
+        test_con.execute(f'DELETE FROM {table}')
+    test_con.commit()
+
 def event():
     return con.execute('SELECT * FROM event WHERE id=1').fetchone()
 
@@ -427,8 +469,8 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
 
 # Role panel is a permanent Discord button, restored after bot restarts.
 # Its message ID is saved so a host can update the existing panel rather than spam duplicates.
-con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
-con.commit()
+official_con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
+official_con.commit()
 
 class HarvestRolePanel(discord.ui.View):
     def __init__(self):
@@ -512,7 +554,7 @@ async def role_panel(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        row = con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
+        row = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
         has_banner = PANEL_BANNER.is_file()
         if row:
             try:
@@ -536,9 +578,9 @@ async def role_panel(interaction: discord.Interaction):
         if has_banner:
             kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await channel.send(**kwargs)
-        con.execute('INSERT INTO role_panel(id,message_id) VALUES(1,?) '
+        official_con.execute('INSERT INTO role_panel(id,message_id) VALUES(1,?) '
                     'ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id', (message.id,))
-        con.commit()
+        official_con.commit()
         await interaction.followup.send(
             f'🍂 Role panel posted in {channel.mention} with @everyone. '
             'The bot needs permission to mention @everyone for the ping to notify members.', ephemeral=True)
@@ -587,159 +629,119 @@ def registration_embed(live_test=False):
     )
 
 
-@harvest.command(name='start', description='Host only: post the Join Harvest Hustle button')
-@app_commands.describe(
-    live_test='True to test the real farming system before 8 November; False for the official event',
-    channel='Optional destination for a LIVE TEST (defaults to the channel where you run this command)'
-)
-async def start(interaction: discord.Interaction, live_test: bool = False,
-                channel: discord.TextChannel | None = None):
+@harvest.command(name='start-test', description='Host only: start a fresh live test in this channel')
+async def start_test(interaction: discord.Interaction):
+    global con
     if not is_host(interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
-    if not interaction.guild:
-        await interaction.response.send_message('Run this command in the server.', ephemeral=True)
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message('Run this in your test text channel.', ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    now = int(time.time())
-    # Live tests can run in the host's test channel; official launches always use
-    # the configured EVENT_CHANNEL_ID to avoid an accidental wrong-channel ping.
-    if live_test:
-        destination = channel or interaction.channel
-        if not isinstance(destination, discord.TextChannel):
-            await interaction.followup.send('Choose a server text channel for the live test.', ephemeral=True)
-            return
-    else:
-        if channel is not None and channel.id != CHANNEL_ID:
-            await interaction.followup.send('Official announcements must use the configured EVENT_CHANNEL_ID. Do not select a different channel.', ephemeral=True)
-            return
-        destination = bot.get_channel(CHANNEL_ID)
-        if destination is None:
-            try:
-                destination = await bot.fetch_channel(CHANNEL_ID)
-            except discord.HTTPException:
-                await interaction.followup.send('Cannot access the official event channel. Check EVENT_CHANNEL_ID.', ephemeral=True)
-                return
     async with lock:
-        e = event()
-        count = con.execute('SELECT COUNT(*) FROM players').fetchone()[0]
-        if live_test:
-            if now >= FARMING_AT:
-                await interaction.followup.send('Live testing is only available before 8 November 2026, 00:00 GMT.', ephemeral=True)
-                return
-            if e and e['live_test']:
-                await interaction.followup.send('A live test is already active. Use its existing Join announcement, or reset it first.', ephemeral=True)
-                return
-            if e and e['ended']:
-                await interaction.followup.send('A completed event cannot be converted into a live test.', ephemeral=True)
-                return
-            if count:
-                await interaction.followup.send('Saved players exist and no live test is marked active. To protect their data, the bot will not start a test or erase them. Ask the host to inspect the database first.', ephemeral=True)
-                return
-            if e and e['start_ts'] != FARMING_AT:
-                await interaction.followup.send('An unexpected event schedule exists. No data was changed; inspect the event record before starting a test.', ephemeral=True)
-                return
-            # An earlier official/test-channel Join announcement with zero players
-            # is safe to supersede. Its button becomes invalid because registration
-            # checks the exact message ID against the active announcement.
-            old_post_id = e['registration_post_id'] if e else None
-            old_channel_id = e['registration_channel_id'] if e else None
-        else:
-            if e and e['live_test']:
-                await interaction.followup.send('A live test is active. Run `/harvest reset-live-test confirm: True` before the official launch.', ephemeral=True)
-                return
-            if e and e['ended']:
-                await interaction.followup.send('This event has already ended.', ephemeral=True)
-                return
-            if e and e['registration_post_id']:
-                await interaction.followup.send('An official Join announcement is already recorded. No duplicate @everyone ping was sent.', ephemeral=True)
-                return
-            if e and e['start_ts'] != FARMING_AT:
-                await interaction.followup.send('Unexpected event start time; no announcement posted. Inspect the schedule first.', ephemeral=True)
-                return
-            old_post_id = None
-            old_channel_id = None
-
-        # Only publish once checks pass. Save event state AFTER Discord accepts
-        # the message, so a posting failure cannot leave a half-started test.
-        try:
-            message = await destination.send(
-                content=('🧪 **Harvest Hustle LIVE TEST — open now!** (No @everyone ping)'
-                         if live_test else '@everyone 🌾 **Harvest Hustle is coming!**'),
-                embed=registration_embed(live_test=live_test),
-                view=HarvestRegistrationView(),
-                allowed_mentions=discord.AllowedMentions(everyone=not live_test, users=False, roles=False))
-        except discord.HTTPException:
-            logging.exception('Unable to post Join announcement')
-            await interaction.followup.send('Could not post the Join announcement. Check channel permissions.', ephemeral=True)
+        if test_mode_active():
+            await interaction.followup.send('A test is already running. Use `/harvest end-test` first.', ephemeral=True)
             return
+        if int(time.time()) >= FARMING_AT:
+            await interaction.followup.send('Pre-launch testing has closed. The official event schedule is now in effect.', ephemeral=True)
+            return
+        official_event = official_con.execute('SELECT * FROM event WHERE id=1').fetchone()
+        official_players = official_con.execute('SELECT COUNT(*) FROM players').fetchone()[0]
+        if official_players or (official_event and official_event['registration_post_id']):
+            await interaction.followup.send('Official registrations exist; refusing to start a test over official data.', ephemeral=True)
+            return
+        clear_test_tables()
+        try:
+            message = await interaction.channel.send(
+                content='🧪 **Harvest Hustle LIVE TEST — open now!** (No @everyone ping)',
+                embed=registration_embed(live_test=True),
+                view=HarvestRegistrationView(),
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=False))
+        except discord.HTTPException:
+            logging.exception('Could not post test announcement')
+            await interaction.followup.send('Could not post the test Join announcement. Check channel permissions.', ephemeral=True)
+            return
+        now = int(time.time())
+        test_con.execute('INSERT INTO event(id,start_ts,ended,live_test,registration_post_id,registration_channel_id,midweek_sent) VALUES(1,?,0,1,?,?,1)',
+                         (now, message.id, interaction.channel.id))
+        test_con.commit()
+        official_con.execute("UPDATE harvest_runtime SET mode='test' WHERE id=1")
+        official_con.commit()
+        con = test_con
+    await interaction.followup.send(f'🧪 Test started in {interaction.channel.mention}. Click **Join Harvest Hustle** and use `/harvest farm`. Finish with `/harvest end-test`.', ephemeral=True)
 
-        if e is None:
-            con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
-        if live_test:
-            con.execute("""UPDATE event SET start_ts=?, live_test=1, ended=0,
-                           winner_id=NULL, last_session_notice=0, midweek_sent=1,
-                           final_sent=0, registration_post_id=?, registration_channel_id=?
-                           WHERE id=1""", (now, message.id, destination.id))
-        else:
-            con.execute("""UPDATE event SET start_ts=?, live_test=0,
-                           registration_post_id=?, registration_channel_id=? WHERE id=1""",
-                        (FARMING_AT, message.id, destination.id))
-        con.commit()
 
-    if live_test:
-        await interaction.followup.send(
-            f'🧪 **Live test started in {destination.mention}.** Players can click Join and use `/harvest farm` now. '
-            'No @everyone ping was sent. When finished, use `/harvest reset-live-test confirm: True` '
-            'to clear test progress and restore the official schedule.'
-            + (' An old, unused Join announcement was superseded; its button can no longer register players.' if old_post_id else ''),
-            ephemeral=True)
-    else:
-        await interaction.followup.send(
-            f'🌾 **Official Join announcement posted in {destination.mention}.** Farming opens '
-            '**8 November 2026, 00:00 GMT**. The announcement tagged @everyone.', ephemeral=True)
-
-
-@harvest.command(name='reset-live-test', description='Host only: delete LIVE TEST farms and restore the official 8 November schedule')
-@app_commands.describe(confirm='Set to true to permanently erase all live-test farms and scores')
-async def reset_live_test(interaction: discord.Interaction, confirm: bool = False):
+@harvest.command(name='end-test', description='Host only: end the test and clear test progress')
+@app_commands.describe(confirm='Confirm clearing all test-only farms, crops and coins')
+async def end_test(interaction: discord.Interaction, confirm: bool = False):
+    global con
     if not is_host(interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
     if not confirm:
-        await interaction.response.send_message(
-            '⚠️ This permanently deletes all LIVE TEST player progress, crops, coins, missions and scores. '
-            'It restores the official **8 November 00:00 GMT → 15 November 00:00 GMT** event. '
-            'To proceed, run `/harvest reset-live-test` with **confirm = True**.', ephemeral=True)
+        await interaction.response.send_message('This clears **test-only** farms, crops, coins and scores. Official records are untouched. Run `/harvest end-test` with **confirm = True**.', ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     async with lock:
-        e = event()
-        if not e or not e['live_test']:
-            await interaction.followup.send('No live test is active. Official game data was not touched.', ephemeral=True)
+        if not test_mode_active():
+            await interaction.followup.send('No test is active. Official data was not touched.', ephemeral=True)
             return
-        post_id = e['registration_post_id']
-        post_channel_id = e['registration_channel_id']
-        for table in ('players', 'plots', 'inventory', 'transactions', 'objective_claims', 'harvest_alerts'):
-            con.execute(f'DELETE FROM {table}')
-        con.execute('UPDATE event SET start_ts=?, live_test=0, registration_ts=NULL, registration_post_id=NULL, '
-                    'ended=0, winner_id=NULL, last_session_notice=-1, midweek_sent=0, final_sent=0, registration_channel_id=NULL WHERE id=1',
-                    (FARMING_AT,))
-        con.commit()
-    if post_id:
+        e = test_con.execute('SELECT * FROM event WHERE id=1').fetchone()
+        post_id = e['registration_post_id'] if e else None
+        channel_id = e['registration_channel_id'] if e else None
+        clear_test_tables()
+        official_con.execute("UPDATE harvest_runtime SET mode='official' WHERE id=1")
+        official_con.commit()
+        con = official_con
+    if post_id and channel_id:
         try:
-            if not post_channel_id:
-                raise ValueError('Old test announcement channel was not recorded')
-            channel = bot.get_channel(post_channel_id) or await bot.fetch_channel(post_channel_id)
-            message = await channel.fetch_message(post_id)
-            await message.delete()
-        except (discord.HTTPException, AttributeError, ValueError):
-            logging.warning('Could not remove old live-test Join post %s; its button will be inactive until a new official post is created', post_id)
-    await interaction.followup.send(
-        '✅ Live test data cleared. Official event restored: **8 November 2026, 00:00 GMT** to '
-        '**15 November 2026, 00:00 GMT**. The role panel was kept. '
-        'When ready, run `/harvest start` with **live_test = False** to post the official Join announcement.',
-        ephemeral=True)
+            channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+            await (await channel.fetch_message(post_id)).delete()
+        except discord.HTTPException:
+            logging.warning('Test announcement could not be deleted, but its Join button is invalid.')
+    await interaction.followup.send('✅ Test finished and test progress cleared. Official data is untouched. On launch day, run `/harvest start`.', ephemeral=True)
+
+
+@harvest.command(name='start', description='Host only: publish the official Join announcement in the configured channel')
+async def start(interaction: discord.Interaction):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with lock:
+        if test_mode_active():
+            await interaction.followup.send('End your test with `/harvest end-test` before launching.', ephemeral=True)
+            return
+        if int(time.time()) < FARMING_AT:
+            await interaction.followup.send('Official launch opens 8 November 2026 at 00:00 GMT. Use `/harvest start-test` to test before then.', ephemeral=True)
+            return
+        e = event()
+        if e and (e['ended'] or e['registration_post_id']):
+            await interaction.followup.send('The official event is finished or its Join announcement already exists. No duplicate ping sent.', ephemeral=True)
+            return
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(CHANNEL_ID)
+            except discord.HTTPException:
+                await interaction.followup.send('Could not access EVENT_CHANNEL_ID.', ephemeral=True)
+                return
+        try:
+            message = await channel.send(
+                content='@everyone 🌾 **Harvest Hustle is OPEN!**',
+                embed=registration_embed(live_test=False),
+                view=HarvestRegistrationView(),
+                allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+        except discord.HTTPException:
+            logging.exception('Could not post official announcement')
+            await interaction.followup.send('Unable to post the official Join announcement.', ephemeral=True)
+            return
+        if e is None:
+            con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
+        con.execute('UPDATE event SET registration_post_id=?,registration_channel_id=? WHERE id=1', (message.id, channel.id))
+        con.commit()
+    await interaction.followup.send(f'🌾 Official Join announcement posted in {channel.mention}. The event ends 15 November 2026 at 00:00 GMT.', ephemeral=True)
 
 
 @harvest.command(name='farm',description='Open your private farming menu')
@@ -1312,7 +1314,7 @@ async def main():
         bot.add_view(HarvestRegistrationView())
         # Preserve existing event data, but correct the previous 9 November schedule when no players have joined.
         async with lock:
-            if event() is None:
+            if event() is None and not test_mode_active():
                 con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
                 con.commit()
                 logging.info('Scheduled game start for 8 November 2026 00:00 UTC; host posts join panel manually')
