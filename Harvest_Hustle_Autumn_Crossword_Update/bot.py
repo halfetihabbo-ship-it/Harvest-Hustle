@@ -707,12 +707,18 @@ async def on_ready():
 
 bot.tree.add_command(harvest)
 
+logging.info("RUNNING FILE: %s", __file__)
+logging.info("LOCAL GROUPS: %s", [c.name for c in bot.tree.get_commands()])
+logging.info("HARVEST SUBCOMMANDS: %s", [c.name for c in harvest.commands])
+
 async def main():
     async with bot:
         await bot.login(TOKEN)
 
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
+        logging.info("TARGET GUILD: %s", GUILD_ID)
+        logging.info("GUILD COMMANDS BEFORE SYNC: %s", [c.name for c in bot.tree.get_commands(guild=guild)])
 
         synced = await bot.tree.sync(guild=guild)
         print(f"Successfully synced {len(synced)} slash commands.")
