@@ -468,7 +468,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
     else:
         await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
 
-# Role panel buttons persist across restarts. The last post ID is saved only to avoid repeat @everyone pings.
+# Role panel buttons persist across restarts; last post ID is retained for compatibility.
 official_con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
 official_con.commit()
 
@@ -615,16 +615,14 @@ async def role_panel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         # Always post a fresh, visible panel. Never edit a previously posted message.
-        # Only the first panel pings @everyone; reposts stay quiet.
-        previous = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
+        # Role panels never ping @everyone; hosts can announce separately.
         has_banner = PANEL_BANNER.is_file()
-        mention_everyone = previous is None
-        content = ('@everyone ' if mention_everyone else '') + (
+        content = (
             '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
             '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
             '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
         kwargs = dict(content=content, embed=role_panel_embed(role_signup_count(interaction.guild), with_banner=has_banner),
-                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=mention_everyone, roles=False, users=False))
+                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions.none())
         if has_banner:
             kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await channel.send(**kwargs)
@@ -634,11 +632,10 @@ async def role_panel(interaction: discord.Interaction):
         official_con.execute('INSERT OR REPLACE INTO role_panel_messages(message_id, channel_id) VALUES(?, ?)', (message.id, channel.id))
         official_con.commit()
         await interaction.followup.send(
-            f'🍂 A NEW role panel was posted in {channel.mention}. ' + ('@everyone was included.' if mention_everyone else 'No repeat @everyone ping was sent.'), ephemeral=True)
+            f'🍂 A NEW role panel was posted in {channel.mention}. No @everyone ping was sent.', ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
-            'I need View Channel, Send Messages, Embed Links, Attach Files and permission '
-            'to mention @everyone in the role-panel channel.', ephemeral=True)
+            'I need View Channel, Send Messages, Embed Links and Attach Files in the role-panel channel.', ephemeral=True)
     except discord.HTTPException:
         await interaction.followup.send('Discord could not post the role panel. Please retry.', ephemeral=True)
 
