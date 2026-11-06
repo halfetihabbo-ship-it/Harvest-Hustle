@@ -21,7 +21,7 @@ DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
 PANEL_BANNER = Path(__file__).with_name('harvest_hustle_role_banner.png')
 WINDOW = 12 * 3600
 DURATION = 14 * WINDOW
-REGISTRATION_HOURS = int(os.environ.get("REGISTRATION_HOURS", "24"))
+FARMING_AT = int(datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc).timestamp())
 ACTIONS = 10
 START_COINS = 2000
 PLOTS = 10
@@ -65,6 +65,7 @@ def add_column(table, column, definition):
     if column not in cols:
         con.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
 add_column('event','registration_ts','INTEGER')
+add_column('event','registration_post_id','INTEGER')
 add_column('event','last_session_notice','INTEGER NOT NULL DEFAULT -1')
 add_column('event','midweek_sent','INTEGER NOT NULL DEFAULT 0')
 add_column('event','final_sent','INTEGER NOT NULL DEFAULT 0')
@@ -95,7 +96,7 @@ def current_window(e):
     return max(0, min(13, (int(time.time()) - e['start_ts']) // WINDOW))
 
 def registration_open(e):
-    return e is not None and not e['ended'] and time.time() < e['start_ts'] and time.time() >= (e['registration_ts'] or 0)
+    return e is not None and not e['ended'] and time.time() < e['start_ts'] + DURATION and bool(e['registration_post_id'])
 
 def started(e):
     return e is not None and time.time() >= e['start_ts']
@@ -192,7 +193,7 @@ class CropSelect(discord.ui.Select):
             if not active(e):
                 msg='The event is not currently active.'
             elif not player(uid):
-                msg='Join the event first with `/harvest join`.'
+                msg='Join the game using the registration button in the main game channel.'
             else:
                 sync_actions(uid,e)
                 p=player(uid)
@@ -315,7 +316,7 @@ async def show_farm(interaction):
             await interaction.response.send_message(msg,ephemeral=True)
             return
         if not player(uid):
-            await interaction.response.send_message('Join first with `/harvest join`.',ephemeral=True)
+            await interaction.response.send_message('Use the Join Harvest Hustle button in the registration announcement first.',ephemeral=True)
             return
         if active(e):
             sync_actions(uid,e)
@@ -347,7 +348,7 @@ async def show_farm(interaction):
         embed.add_field(name='🌱 Plots Owned',value=f'{available_plots(p)}/{PLOTS + UPGRADES["extra_plot"]["max"]} · {len(plots)} occupied · {available_plots(p)-len(plots)} empty',inline=False)
         embed.add_field(name='🌾 Plot Details',value='\n'.join(lines),inline=False)
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
-        embed.add_field(name='📊 Career stats',value=f'Planted: {p["planted"]} · Harvested: {p["harvested"]} · Lifetime sales: {p["sold"]:,}c',inline=False)
+        embed.add_field(name='📊 Career stats',value=f'Planted: {p["planted"]} · Harvested: {p["harvested"]} · Sales Revenue: {p["sold"]:,}c',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
         embed.set_footer(text='When a crop is ready, click Harvest Ready, then Sell Produce. Only planting uses actions.')
     await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
@@ -384,7 +385,7 @@ class HarvestRolePanel(discord.ui.View):
                 await interaction.response.send_message('🍂 You have left the Harvest Hustle notification role. You can rejoin anytime.', ephemeral=True)
             else:
                 await member.add_roles(role, reason='Harvest Hustle self-service role panel')
-                await interaction.response.send_message('🌾 You now have the Harvest Hustle role! You will receive event announcement pings. Register for the game separately using `/harvest join`.', ephemeral=True)
+                await interaction.response.send_message('🌾 You now have the Harvest Hustle role! You will receive event announcement pings. Watch the main game channel for the host-posted join button.', ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message('I cannot manage that role. Please give me **Manage Roles** and move my highest role **above** the Harvest Hustle role.', ephemeral=True)
         except discord.HTTPException:
@@ -405,7 +406,7 @@ def role_panel_embed(with_banner=True):
             '🥉 **3rd Place:** 75c + HC Box\n\n'
             '🌻 **React below to get the role** and stay updated with event announcements and reminders!\n\n'
             '📖 Want the full details? Check `/harvest help`.\n'
-            '🌱 When registration opens, join the game using `/harvest join`.'
+            '🌱 Registration opens on 8 November — look for the Join button in the main game channel.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
     )
@@ -454,7 +455,7 @@ async def role_panel(interaction: discord.Interaction):
                 pass
         # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
         content = '@everyone 🎮 **It’s time for another Discord game!** 🍂 **Harvest Hustle** is coming! React below to get the role. '
-        content += 'When registration opens, enter with `/harvest join`!'
+        content += 'Registration opens on 8 November — watch the main game channel for the Join button!'
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
         if has_banner:
@@ -473,33 +474,87 @@ async def role_panel(interaction: discord.Interaction):
     except discord.HTTPException:
         await interaction.followup.send('Discord could not post or update the role panel. Please retry.', ephemeral=True)
 
-@harvest.command(name='start',description='Host only: open registration and schedule a seven-day championship')
-async def start(interaction:discord.Interaction):
-    if not is_host(interaction):
-        await interaction.response.send_message('Host only.',ephemeral=True); return
-    async with lock:
-        e=event()
-        if e:
-            await interaction.response.send_message('An event already exists. Use `/harvest reset` only after the old event ends.',ephemeral=True); return
-        now=int(time.time())
-        ts=now+REGISTRATION_HOURS*3600
-        con.execute('INSERT INTO event(id,start_ts,ended,registration_ts) VALUES(1,?,0,?)',(ts,now))
-        con.commit()
-    msg=f'🍂 **HARVEST HUSTLE REGISTRATION IS OPEN!**\nRegister with `/harvest join` now.\n**Farming begins:** {stamp(ts)}\n**Ends:** {stamp(ts+DURATION)}\nSeven days · two sessions daily · 10 planting actions per session.\nEveryone begins with 2,000 coins and 10 plots.'
-    await interaction.response.send_message(f'🍂 Registration opened. Farming starts {stamp(ts)}. Announcement queued.',ephemeral=True)
-    await send_announcement(msg,ping=True)
+class HarvestRegistrationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-@harvest.command(name='join',description='Join Harvest Hustle')
-async def join(interaction:discord.Interaction):
+    @discord.ui.button(label='Join Harvest Hustle', emoji='🌱', style=discord.ButtonStyle.success,
+                       custom_id='harvest_hustle:register:v1')
+    async def register(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async with lock:
+            e = event()
+            if not registration_open(e):
+                message = 'Joining is not open yet, or the event has ended. Please use the official registration post.'
+            elif player(interaction.user.id):
+                message = '🌾 You are already registered! Farming begins on 8 November at 00:00 GMT.'
+            else:
+                con.execute('INSERT INTO players(user_id,joined_ts,action_window) VALUES(?,?,?)',
+                            (interaction.user.id, int(time.time()), current_window(e)))
+                con.commit()
+                message = ('🎉 **You’re in!** Welcome to Harvest Hustle! 🌾\n'
+                           'Farming begins **8 November at 00:00 GMT**. '
+                           'You’ll start with **2,000 coins and 10 plots**. '
+                           'Use `/harvest help` for the full guide.')
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+def registration_embed():
+    return discord.Embed(
+        title='🌾 Harvest Hustle — Registration Is Open!',
+        description=(
+            '🚜 **It’s time to get farming!**\n\n'
+            'Ready to grow your farm and compete for some fantastic prizes?\n\n'
+            'Click **Join Harvest Hustle** below to enter the competition!\n\n'
+            '🌱 **Farming begins:** 8 November, 00:00 GMT\n'
+            '🏆 **Prizes:** 1st 200c + HC Box · 2nd 100c + HC Box · 3rd 75c + HC Box\n\n'
+            '📖 Want to know how it works? Use `/harvest help`.'
+        ),
+        color=discord.Color.from_rgb(160, 104, 49)
+    )
+
+
+@harvest.command(name='start', description='Host only: post the Join Harvest Hustle button in the game channel')
+async def start(interaction: discord.Interaction):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
     async with lock:
-        e=event()
-        if not registration_open(e): msg='Registration is closed. Join during the pre-event registration period.'
-        elif player(interaction.user.id): msg='You are already registered. Use `/harvest farm`.'
-        else:
-            con.execute('INSERT INTO players(user_id,joined_ts,action_window) VALUES(?,?,?)',(interaction.user.id,int(time.time()),current_window(e)))
+        e = event()
+        if e is None:
+            con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
             con.commit()
-            msg=f'🍁 You are registered! Farming starts {stamp(e["start_ts"])}. You will begin with 2,000 coins, ten plots and 10 planting actions per session.'
-    await interaction.response.send_message(msg,ephemeral=True)
+            e = event()
+        if e['ended'] or int(time.time()) >= e['start_ts'] + DURATION:
+            await interaction.followup.send('This event has already finished.', ephemeral=True)
+            return
+        if e['registration_post_id']:
+            await interaction.followup.send('The join announcement has already been posted. No duplicate @everyone ping was sent.', ephemeral=True)
+            return
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(CHANNEL_ID)
+        except discord.HTTPException:
+            await interaction.followup.send('Could not find the configured game channel. Check EVENT_CHANNEL_ID.', ephemeral=True)
+            return
+    try:
+        message = await channel.send(
+            content='@everyone 🌾 **Harvest Hustle is coming!**',
+            embed=registration_embed(),
+            view=HarvestRegistrationView(),
+            allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False))
+    except discord.HTTPException:
+        logging.exception('Unable to post join announcement')
+        await interaction.followup.send('Could not post the announcement. Check channel and @everyone permissions.', ephemeral=True)
+        return
+    async with lock:
+        con.execute('UPDATE event SET registration_post_id=? WHERE id=1 AND registration_post_id IS NULL', (message.id,))
+        con.commit()
+    await interaction.followup.send(
+        f'🌾 Join button posted in {channel.mention}. The game begins **8 November 2026 at 00:00 GMT**. '
+        'The announcement was tagged @everyone.', ephemeral=True)
+
 
 @harvest.command(name='farm',description='Open your private farming menu')
 async def farm(interaction:discord.Interaction):
@@ -528,15 +583,15 @@ async def rules(interaction:discord.Interaction):
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
         '**Winner**: coins + stored produce sale value + upgrade resale value. **Growing crops are worth 0 at closing.** Tie order: lifetime sales, total crops harvested, earlier join, then Discord user ID.\n\n'
-        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+30c), harvest 2 crops (+50c), sell once (+70c); claim with `/harvest objectives` each event day. No random crop failures, market price swings or speed bonuses. Registration closes at the start. All progress is stored in SQLite.')
+        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+30c), harvest 2 crops (+50c), sell once (+70c); claim with `/harvest objectives` each event day. No random crop failures, market price swings or speed bonuses. Players join using the host-posted button; there is no separate registration countdown. All progress is stored in SQLite.')
     await interaction.response.send_message(embed=e,ephemeral=True)
 
 @harvest.command(name='help', description='Complete guide to Harvest Hustle, commands, missions and prizes')
 async def harvest_help(interaction: discord.Interaction):
     intro = make_embed('🌾 Harvest Hustle | How to Play',
-        '**Goal:** Build the highest-value farm over **7 days**. Registration lasts **24 hours** before farming starts; late joins are not allowed.\n\n'
+        '**Goal:** Build the highest-value farm over **7 days**. The host posts the join button manually; farming starts **8 November 2026 at 00:00 GMT**. There is no separate registration period.\n\n'
         '**Getting started**\n'
-        '1. Use `/harvest join` during registration.\n'
+        '1. Click **Join Harvest Hustle** in the host announcement in the main game channel.\n'
         '2. Once farming begins, use `/harvest farm` to open your private controls.\n'
         '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**.\n'
         '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
@@ -561,7 +616,7 @@ async def harvest_help(interaction: discord.Interaction):
         '**Player commands**\n'
         '`/harvest help` — This guide\n'
         '`/harvest rules` — Rules summary\n'
-        '`/harvest join` — Register\n'
+        'Registration — Click **Join Harvest Hustle** in the host announcement\n'
         '`/harvest farm` — Open your farm; use **Plant**, **Harvest Ready**, **Sell Produce**, **Upgrades** and **Refresh Farm** buttons\n'
         '`/harvest objectives` — View and claim daily missions (claim before the next event day)\n'
         '`/harvest leaderboard` — Rankings\n'
@@ -569,11 +624,11 @@ async def harvest_help(interaction: discord.Interaction):
         '`/harvest status` — Event schedule\n\n'
         '**Host-only commands**\n'
         '`/harvest role-panel` — Post or refresh the role panel\n'
-        '`/harvest start` — Open registration and schedule the game\n'
+        '`/harvest start` — Host: post the @everyone join announcement and button\n'
         '`/harvest dashboard` — View activity and standings\n'
         '`/harvest history` — Review player transactions\n'
         '`/harvest adjust-coins` — Adjust a player’s coins\n'
-        '`/harvest test` — Try a private practice farm\n'
+        '`/harvest test` — Private practice farm; actions open new private results, and Send Test DM checks alerts\n'
         '`/harvest reset` — Reset a completed event.\n\n'
         '**Fair play:** No random crop failures, market price swings or speed bonuses. All coin amounts above are **in-game coins** unless explicitly described as Habbo credits.')
     await interaction.response.send_message(embeds=[intro, economy, finish], ephemeral=True)
@@ -765,6 +820,7 @@ async def event_watcher():
         if not e:return
         if e['ended'] and e['final_sent']:return
         now=int(time.time())
+        notice=None
         if now >= e['start_ts']+DURATION:
             ranks=board(e)
             winner=ranks[0][3] if ranks else None
@@ -888,13 +944,16 @@ class HarvestTestView(discord.ui.View):
                            f'**Coins:** {self.coins:,} · **Farm value:** {self.value():,}\n'
                            f'**Planting actions:** {self.actions}/{ACTIONS} used\n'
                            f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
-                           f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales:** {self.sold:,}\n\n'
+                           f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
         embed.set_footer(text='TEST ONLY · No real coins, event records, announcements or leaderboard changes')
         return embed
 
     async def refresh(self, interaction, notice):
-        await interaction.response.edit_message(content=notice, embed=self.summary(), view=self)
+        # Each test action creates a fresh, private result with updated controls.
+        # Remove controls from the previous message to avoid stale menus.
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send(content=notice, embed=self.summary(), view=self, ephemeral=True)
 
     @discord.ui.select(placeholder='🧪 Plant a test crop', row=0,
                        options=[discord.SelectOption(label=v['name'], value=k,
@@ -947,9 +1006,16 @@ class HarvestTestView(discord.ui.View):
             self.session=self.test_hour//12
             if self.test_hour//12>previous//12 and self.test_hour<168:
                 self.actions=0
+            newly_ready=[crop for crop, planted in self.plots.values()
+                         if previous < planted + CROPS[crop]['hours'] <= self.test_hour]
             ready_count=sum(1 for crop, planted in self.plots.values() if self.test_hour-planted>=CROPS[crop]['hours'])
             msg=(f'Advanced to hour {self.test_hour}/168. '
-                 + (f'🧺 {ready_count} crop(s) ready! Click **Harvest Ready**, then **Sell Produce**.' if ready_count else 'Crops are still growing.'))
+                 + (f'🔔 **SIMULATED HARVEST ALERT:** {len(newly_ready)} crop(s) just matured! '
+                    f'In the live game this triggers a DM. Click **Harvest Ready**, then **Sell Produce**. '
+                    if newly_ready else
+                    (f'🧺 {ready_count} crop(s) ready! Click **Harvest Ready**, then **Sell Produce**.'
+                     if ready_count else 'Crops are still growing.')))
+
         else:
             msg=f'Test finished! Final farm value: {self.value():,}. Unharvested crops count for zero.'
         await self.refresh(interaction,msg)
@@ -978,6 +1044,21 @@ class HarvestTestView(discord.ui.View):
             msg = 'Purchased a market stall (+6% sale value).'
         await self.refresh(interaction, msg)
 
+    @discord.ui.button(label='Send Test DM', emoji='🔔', style=discord.ButtonStyle.secondary, row=3)
+    async def dm_test(self, interaction, button):
+        try:
+            await interaction.user.send(
+                '🧪 **Harvest Hustle — Test harvest notification**\n'
+                'This is a test of the automatic DM system. When your crops mature '
+                'in the live event, you will receive a message telling you to open '
+                '`/harvest farm` and click **Harvest Ready**, then **Sell Produce**.\n'
+                'This test does not affect the live event.')
+            msg='✅ Test DM sent! Check your Discord direct messages.'
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logging.info('Could not send test harvest DM to %s: %s', interaction.user.id, exc)
+            msg='⚠️ Could not deliver the test DM. Check your Discord DM privacy settings and try again.'
+        await self.refresh(interaction, msg)
+
     @discord.ui.button(label='Reset Test', emoji='🔄', style=discord.ButtonStyle.danger, row=2)
     async def reset_test(self, interaction, button):
         self.__init__(self.host_id)
@@ -990,7 +1071,7 @@ async def harvest_test(interaction: discord.Interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
     view = HarvestTestView(interaction.user.id)
-    await interaction.response.send_message('Plant crops, advance sessions, harvest, sell and upgrade. This is a separate test farm.',
+    await interaction.response.send_message('Every action opens a fresh private result. Use **Advance 2 Hours** to simulate crop maturity alerts, or **Send Test DM** to check real DM delivery. This test farm is separate from the live game.',
                                             embed=view.summary(), view=view, ephemeral=True)
 
 bot.tree.add_command(harvest)
@@ -1012,6 +1093,19 @@ async def main():
         print(f"Successfully synced {len(synced)} slash commands.")
 
         bot.add_view(HarvestRolePanel())
+        bot.add_view(HarvestRegistrationView())
+        # Preserve existing event data, but correct the previous 9 November schedule when no players have joined.
+        async with lock:
+            if event() is None:
+                con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
+                con.commit()
+                logging.info('Scheduled game start for 8 November 2026 00:00 UTC; host posts join panel manually')
+            elif (event()['start_ts'] == FARMING_AT + 24*3600 and
+                  con.execute('SELECT COUNT(*) FROM players').fetchone()[0] == 0 and
+                  not event()['ended']):
+                con.execute('UPDATE event SET start_ts=?, registration_ts=NULL WHERE id=1', (FARMING_AT,))
+                con.commit()
+                logging.info('Migrated unused November event start to 8 November 2026 00:00 UTC')
 
         if not event_watcher.is_running():
             event_watcher.start()
