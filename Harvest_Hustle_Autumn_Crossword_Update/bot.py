@@ -1,5 +1,4 @@
 # Harvest Hustle deployment update
-# Harvest Hustle deployment update
 import os
 import sqlite3
 import asyncio
@@ -509,28 +508,34 @@ class HarvestRolePanel(discord.ui.View):
 
 def role_panel_embed(with_banner=True):
     embed = discord.Embed(
-        title='🍂🌾 HARVEST HUSTLE — THE AUTUMN CHALLENGE!',
+        title='🍂🌾 HARVEST HUSTLE — THE ULTIMATE AUTUMN SHOWDOWN!',
         description=(
-            '🎮 **IT’S TIME FOR ANOTHER DISCORD GAME!** 🎮\n\n'
-            '🚜 **Ready to grow your way to victory?** Plant crops, harvest produce, '
-            'earn coins and upgrade your farm to climb the leaderboard!\n\n'
-            '🏆 **BIG PRIZES UP FOR GRABS!** 🏆\n'
-            '🥇 **1ST PLACE — 200 CREDITS + HC BOX**\n'
-            '🥈 **2ND PLACE — 100 CREDITS + HC BOX**\n'
-            '🥉 **3RD PLACE — 75 CREDITS + HC BOX**\n\n'
-            '📅 **EVENT DATES — EXACTLY 7 DAYS**\n'
-            '🟢 **OPENS:** Sunday, **8 November 2026 at 12:00 AM GMT**\n'
-            '🔴 **CLOSES:** Sunday, **15 November 2026 at 12:00 AM GMT**\n\n'
-            '🍁 **WANT TO TAKE PART?**\n'
-            'React below to get the event role and access to the game channels! '
-            'Watch for the separate **Join Harvest Hustle** announcement when the event opens.\n\n'
-            '📖 Use **`/harvest help`** for the full guide.'
+            '🎮 **ANOTHER DISCORD GAME IS HERE!** 🎮\\n\\n'
+            'After all the excitement of our **Trick or Treat** event, '
+            'we’re back with another **HUGE Discord competition!** 🔥\\n\\n'
+            '🚜 **THIS TIME, WE’RE HEADING TO THE FARM!**\\n'
+            'Plant crops 🌱, harvest produce 🧺, earn coins 💰 and upgrade '
+            'your farm to climb the leaderboard. You have **7 DAYS** to '
+            'build your farming empire — every decision counts!\\n\\n'
+            '🏆 **HUGE PRIZES UP FOR GRABS!** 🏆\\n\\n'
+            '🥇 **1ST PLACE — 200 HABBO CREDITS + HC BOX** 👑\\n\\n'
+            '🥈 **2ND PLACE — 100 HABBO CREDITS + HC BOX**\\n\\n'
+            '🥉 **3RD PLACE — 75 HABBO CREDITS + HC BOX**\\n\\n'
+            '💰 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** 💰\\n\\n'
+            '📅 **MARK YOUR CALENDARS!**\\n'
+            '🟢 **STARTS:** Sunday, 8 November 2026 — **12:00 AM GMT**\\n'
+            '🔴 **ENDS:** Sunday, 15 November 2026 — **12:00 AM GMT**\\n\\n'
+            '🍁 **READY TO JOIN THE FUN?**\\n'
+            '👇 **CLICK THE BUTTON BELOW TO CLAIM YOUR HARVEST HUSTLE ROLE!**\\n'
+            'Get access to the event channels and watch for the separate '
+            '**Join Harvest Hustle** announcement when the game launches.\\n\\n'
+            '📖 Want a head start? Check out `/harvest help`!'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
     )
     if with_banner:
         embed.set_image(url='attachment://harvest_hustle_role_banner.png')
-    embed.set_footer(text='🌻 Seven days. One leaderboard. Who will be crowned the harvest champion?')
+    embed.set_footer(text='🌻 7 DAYS. 3 WINNERS. ONE HARVEST CHAMPION. Will it be you?')
     return embed
 
 intents=discord.Intents.default()
@@ -572,8 +577,9 @@ async def role_panel(interaction: discord.Interaction):
             except discord.NotFound:
                 pass
         # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
-        content = '@everyone 🎮 **It’s time for another Discord game!** 🍂 **Harvest Hustle** is coming! React below to get the role. '
-        content += '🗓️ **8 Nov, 12:00 AM GMT → 15 Nov, 12:00 AM GMT!** 🏆 **200c + HC Box** for 1st! Watch for the Join button.'
+        content = ('@everyone 🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
+                   '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
+                   '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
         if has_banner:
