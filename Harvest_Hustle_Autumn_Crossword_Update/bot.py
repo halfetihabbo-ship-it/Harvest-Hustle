@@ -578,6 +578,18 @@ class HarvestRolePanel(discord.ui.View):
 intents=discord.Intents.default()
 intents.members = True  # Enable Server Members Intent in Discord Developer Portal too.
 bot=commands.Bot(command_prefix='!',intents=intents)
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Keep the official Harvest Hustle channel free of ordinary user messages."""
+    if message.guild is not None and message.channel.id == CHANNEL_ID and not message.author.bot:
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass  # Missing Manage Messages, already removed, or Discord API error.
+        return
+    await bot.process_commands(message)
+
 harvest=app_commands.Group(name='harvest',description='Harvest Hustle farming competition')
 
 @harvest.command(name='role-panel', description='Host only: post a new Harvest Hustle role panel')
