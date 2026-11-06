@@ -467,10 +467,8 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
     else:
         await interaction.response.send_message(embed=embed,view=FarmView(uid) if active(e) else None,ephemeral=True)
 
-# Role panel is a permanent Discord button, restored after bot restarts.
-# Its message ID is saved so a host can update the existing panel rather than spam duplicates.
+# Role panel buttons persist across restarts. The last post ID is saved only to avoid repeat @everyone pings.
 official_con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
-official_con.execute('CREATE TABLE IF NOT EXISTS role_panel_signups(user_id INTEGER PRIMARY KEY)')
 official_con.commit()
 
 class HarvestRolePanel(discord.ui.View):
@@ -497,48 +495,14 @@ class HarvestRolePanel(discord.ui.View):
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason='Harvest Hustle self-service role panel')
-                async with lock:
-                    official_con.execute('DELETE FROM role_panel_signups WHERE user_id=?', (member.id,))
-                    official_con.commit()
-                await refresh_role_signup_count(interaction.guild)
                 await interaction.response.send_message('🍂 You have left the Harvest Hustle notification role. You can rejoin anytime.', ephemeral=True)
             else:
                 await member.add_roles(role, reason='Harvest Hustle self-service role panel')
-                async with lock:
-                    official_con.execute('INSERT OR IGNORE INTO role_panel_signups(user_id) VALUES(?)', (member.id,))
-                    official_con.commit()
-                await refresh_role_signup_count(interaction.guild)
                 await interaction.response.send_message('🌾 You now have the Harvest Hustle role! You will receive event announcement pings. Watch the main game channel for the host-posted join button.', ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message('I cannot manage that role. Please give me **Manage Roles** and move my highest role **above** the Harvest Hustle role.', ephemeral=True)
         except discord.HTTPException:
             await interaction.response.send_message('Discord could not update your role. Please try again.', ephemeral=True)
-
-
-def role_signup_count():
-    # Counts unique members who opted in using this bot's role panel.
-    return official_con.execute('SELECT COUNT(*) FROM role_panel_signups').fetchone()[0]
-
-
-async def refresh_role_signup_count(guild):
-    # Keep the same panel message; never ping members on count changes.
-    async with lock:
-        row = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
-        if not row:
-            return
-        channel = guild.get_channel(CHANNEL_ID) or bot.get_channel(CHANNEL_ID)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(CHANNEL_ID)
-            except discord.HTTPException:
-                return
-        try:
-            message = await channel.fetch_message(row['message_id'])
-            # Editing an existing embed keeps its original attachment intact.
-            await message.edit(embed=role_panel_embed(with_banner=PANEL_BANNER.is_file()),
-                               view=HarvestRolePanel())
-        except discord.HTTPException:
-            logging.exception('Could not refresh Harvest Hustle sign-up counter')
 
 
 def role_panel_embed(with_banner=True):
@@ -577,7 +541,7 @@ intents=discord.Intents.default()
 bot=commands.Bot(command_prefix='!',intents=intents)
 harvest=app_commands.Group(name='harvest',description='Harvest Hustle farming competition')
 
-@harvest.command(name='role-panel', description='Host only: post or refresh the permanent Harvest Hustle role panel')
+@harvest.command(name='role-panel', description='Host only: post a new Harvest Hustle role panel')
 async def role_panel(interaction: discord.Interaction):
     if not is_host(interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
@@ -595,28 +559,17 @@ async def role_panel(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        row = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
+        # Always post a fresh, visible panel. Never edit a previously posted message.
+        # Only the first panel pings @everyone; reposts stay quiet.
+        previous = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
         has_banner = PANEL_BANNER.is_file()
-        if row:
-            try:
-                message = await channel.fetch_message(row['message_id'])
-                if has_banner:
-                    banner = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
-                    await message.edit(embed=role_panel_embed(), view=HarvestRolePanel(), attachments=[banner])
-                else:
-                    await message.edit(embed=role_panel_embed(with_banner=False), view=HarvestRolePanel())
-                await interaction.followup.send(
-                    f'🍂 Existing role panel refreshed in {channel.mention}. No repeat @everyone ping was sent.',
-                    ephemeral=True)
-                return
-            except discord.NotFound:
-                pass
-        # Mention everyone once on a new post. Discord server/channel @everyone permissions still apply.
-        content = ('@everyone 🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
-                   '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
-                   '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
+        mention_everyone = previous is None
+        content = ('@everyone ' if mention_everyone else '') + (
+            '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
+            '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
+            '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
         kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
-                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=True, roles=False, users=False))
+                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=mention_everyone, roles=False, users=False))
         if has_banner:
             kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await channel.send(**kwargs)
@@ -624,14 +577,13 @@ async def role_panel(interaction: discord.Interaction):
                     'ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id', (message.id,))
         official_con.commit()
         await interaction.followup.send(
-            f'🍂 Role panel posted in {channel.mention} with @everyone. '
-            'The bot needs permission to mention @everyone for the ping to notify members.', ephemeral=True)
+            f'🍂 A NEW role panel was posted in {channel.mention}. ' + ('@everyone was included.' if mention_everyone else 'No repeat @everyone ping was sent.'), ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
             'I need View Channel, Send Messages, Embed Links, Attach Files and permission '
             'to mention @everyone in the event channel.', ephemeral=True)
     except discord.HTTPException:
-        await interaction.followup.send('Discord could not post or update the role panel. Please retry.', ephemeral=True)
+        await interaction.followup.send('Discord could not post the role panel. Please retry.', ephemeral=True)
 
 class HarvestRegistrationView(discord.ui.View):
     def __init__(self):
