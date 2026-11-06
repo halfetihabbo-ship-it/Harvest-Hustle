@@ -705,18 +705,21 @@ async def on_ready():
     logging.info('Logged in as %s',bot.user)
 
 async def main():
-    if not TOKEN: raise RuntimeError('DISCORD_TOKEN environment variable is required')
     async with bot:
-        bot.add_view(HarvestRolePanel())
-        bot.tree.add_command(harvest)
-        if GUILD_ID:
-            guild=discord.Object(id=GUILD_ID)
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        else:
-            await bot.tree.sync()
-        event_watcher.start()
-        await bot.start(TOKEN)
+        await bot.login(TOKEN)
+
+        guild = discord.Object(id=GUILD_ID)
+
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+
+        print(f"Successfully synced {len(synced)} slash commands.")
+
+        await bot.connect(reconnect=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__=='__main__':
     asyncio.run(main())
