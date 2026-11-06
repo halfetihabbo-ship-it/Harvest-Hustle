@@ -863,7 +863,7 @@ async def rules(interaction:discord.Interaction):
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
         '**Winner**: coins + stored produce sale value + upgrade resale value. **Growing crops are worth 0 at closing.** Tie order: lifetime sales, total crops harvested, earlier join, then Discord user ID.\n\n'
-        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+50c), harvest 2 crops (+75c), sell once (+100c), plus a +75c completion bonus; claim with `/harvest objectives` each event day. No random crop failures, market price swings or speed bonuses. Players join using the host-posted button; there is no separate registration countdown. All progress is stored in SQLite.')
+        'For a full walkthrough, use `/harvest help`. Harvest milestones at 5, 15, 30 and 50 crops are recognition-only. Daily missions: plant 2 crops (+50c), harvest 2 crops (+75c), sell once (+100c), plus a +75c completion bonus; claim using the **Claim Rewards** button in Daily Missions each event day. No random crop failures, market price swings or speed bonuses. Players join using the host-posted button; there is no separate registration countdown. All progress is stored in SQLite.')
     await interaction.response.send_message(embed=e,ephemeral=True)
 
 @harvest.command(name='help', description='Complete guide to Harvest Hustle, commands, missions and prizes')
@@ -887,12 +887,12 @@ async def harvest_help(interaction: discord.Interaction):
         '**Expand your farm**\n'
         '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space **and one planting action per 12-hour session**. Resale value: **50% of purchase price**.\n'
         '🛒 Market Stall: **1,200c** per level, up to **2 levels**. Each level increases produce sale prices by **6%** (maximum +12%). Resale value: **600c** per level.\n\n'
-        '**Three daily missions** (claim via `/harvest objectives`)\n'
+        '**Three daily missions** (claim via the **Claim Rewards** button)\n'
         '• Plant 2 crops: **+50c**\n'
         '• Harvest 2 crops: **+75c**\n'
         '• Sell produce at least once: **+100c**\n'
         '• Complete all three: **+75c daily bonus**\n'
-        'Missions reset each event day. Open objectives to claim earned rewards **before the next day**. Maximum **300c per day** (2,100c over seven days). Harvest milestones (5/15/30/50) are recognition-only.')
+        'Missions reset each event day. Open objectives and press **Claim Rewards** to collect earned rewards **before the next day**. Maximum **300c per day** (2,100c over seven days). Harvest milestones (5/15/30/50) are recognition-only.')
     finish = make_embed('🏆 Winning, Prizes & Commands',
         '**Final farm value** = remaining coins + harvested produce still in inventory at its current sale value + upgrade resale value. **Unharvested crops are worth 0 at event closing.**\n'
         'Ties: lifetime produce sales → crops harvested → earlier registration → Discord user ID.\n\n'
@@ -902,7 +902,7 @@ async def harvest_help(interaction: discord.Interaction):
         '`/harvest rules` — Rules summary\n'
         'Registration — Click **Join Harvest Hustle** in the host announcement\n'
         '`/harvest farm` — Open your farm; use **Plant**, **Harvest Ready**, **Sell Produce**, **Upgrades** and **Refresh Farm** buttons\n'
-        '`/harvest objectives` — View and claim daily missions (claim before the next event day)\n'
+        '`/harvest objectives` — View daily missions and press **Claim Rewards** before the next event day\n'
         '`/harvest leaderboard` — Rankings\n'
         '`/harvest stats` — Your farm statistics\n'
         '`/harvest status` — Event schedule\n\n'
@@ -956,7 +956,7 @@ DAILY_MISSIONS = (
     ('trade', 'Sell produce at least once', 'sell', 1, 100),
 )
 
-async def show_objectives(interaction):
+async def show_objectives(interaction, claim=False):
     uid=interaction.user.id
     async with lock:
         e=event()
@@ -971,38 +971,57 @@ async def show_objectives(interaction):
         harvested=sum(int(r['detail'].split()[0]) for r in logs if r['action']=='harvest' and r['detail'].split()[0].isdigit())
         sales=sum(1 for r in logs if r['action']=='sell')
         counts={'plant':planted,'harvest':harvested,'sell':sales}
-        lines=[];earned=0
+        earned=0
+        if claim:
+            for key,label,action,target,reward in DAILY_MISSIONS:
+                if counts[action]>=target:
+                    cur=con.execute('INSERT OR IGNORE INTO objective_claims VALUES(?,?,?)',(uid,day,key))
+                    if cur.rowcount:
+                        con.execute('UPDATE players SET coins=coins+? WHERE user_id=?',(reward,uid))
+                        log_action(uid,e,'mission',key,reward)
+                        earned+=reward
+            if all(counts[action]>=target for _,_,action,target,_ in DAILY_MISSIONS):
+                cur=con.execute('INSERT OR IGNORE INTO objective_claims VALUES(?,?,?)',(uid,day,'daily_bonus'))
+                if cur.rowcount:
+                    con.execute('UPDATE players SET coins=coins+75 WHERE user_id=?',(uid,))
+                    log_action(uid,e,'mission','daily_bonus',75)
+                    earned+=75
+            con.execute('UPDATE players SET objectives_claimed=(SELECT COUNT(*) FROM objective_claims WHERE user_id=?) WHERE user_id=?',(uid,uid))
+            con.commit()
+        lines=[]
+        unclaimed=0
         for key,label,action,target,reward in DAILY_MISSIONS:
-            previously=con.execute('SELECT 1 FROM objective_claims WHERE user_id=? AND day=? AND objective=?',(uid,day,key)).fetchone()
-            if counts[action]>=target and not previously:
-                con.execute('INSERT OR IGNORE INTO objective_claims VALUES(?,?,?)',(uid,day,key))
-                con.execute('UPDATE players SET coins=coins+? WHERE user_id=?',(reward,uid))
-                log_action(uid,e,'mission',key,reward)
-                earned+=reward
             done=counts[action]>=target
-            lines.append(f'{"✅" if done else "⬜"} **{label}** — {min(counts[action],target)}/{target} · **+{reward}c**' + (' (claimed)' if done else ''))
-        # The completion bonus is claimed once per event day, only after all 3
-        # mission targets have been achieved. A unique DB key prevents duplicates.
+            claimed=con.execute('SELECT 1 FROM objective_claims WHERE user_id=? AND day=? AND objective=?',(uid,day,key)).fetchone() is not None
+            if done and not claimed:
+                unclaimed+=reward
+            status=' (claimed)' if claimed else ' (ready to claim)' if done else ''
+            lines.append(f'{"✅" if done else "⬜"} **{label}** — {min(counts[action],target)}/{target} · **+{reward}c**'+status)
         all_done=all(counts[action]>=target for _,_,action,target,_ in DAILY_MISSIONS)
-        bonus_claimed=con.execute('SELECT 1 FROM objective_claims WHERE user_id=? AND day=? AND objective=?',
-                                  (uid,day,'daily_bonus')).fetchone()
+        bonus_claimed=con.execute('SELECT 1 FROM objective_claims WHERE user_id=? AND day=? AND objective=?',(uid,day,'daily_bonus')).fetchone() is not None
         if all_done and not bonus_claimed:
-            cur=con.execute('INSERT OR IGNORE INTO objective_claims VALUES(?,?,?)',
-                            (uid,day,'daily_bonus'))
-            if cur.rowcount:
-                con.execute('UPDATE players SET coins=coins+75 WHERE user_id=?',(uid,))
-                log_action(uid,e,'mission','daily_bonus',75)
-                earned+=75
+            unclaimed+=75
         lines.append(('✅' if all_done else '⬜') + ' **Complete all three missions** — ' +
                      ('3/3' if all_done else f'{sum(counts[action]>=target for _,_,action,target,_ in DAILY_MISSIONS)}/3') +
-                     ' · **+75c bonus**' + (' (claimed)' if all_done else ''))
-        con.execute('UPDATE players SET objectives_claimed=(SELECT COUNT(*) FROM objective_claims WHERE user_id=?) WHERE user_id=?',(uid,uid))
+                     ' · **+75c bonus**' + (' (claimed)' if bonus_claimed else ' (ready to claim)' if all_done else ''))
         total=con.execute("SELECT COUNT(*) FROM objective_claims WHERE user_id=? AND objective!='daily_bonus'",(uid,)).fetchone()[0]
-        con.commit()
-    message='\n'.join(lines)+f'\n\n🏅 **Missions completed:** {total} · **Rewards claimed now:** +{earned} coins\nMaximum **300c per day** including the completion bonus. Claim before the next event day. Rewards are once per mission per day.'
-    await interaction.response.send_message(embed=make_embed(f'🎯 Day {day+1} Daily Missions',message),ephemeral=True)
+    suffix=(f'\n\n🪙 **Claimed now: +{earned} coins**' if claim else f'\n\n🪙 **Ready to claim: +{unclaimed} coins**')
+    message='\n'.join(lines)+f'\n\n🏅 **Missions completed:** {total}'+suffix+'\nMaximum **300c per day** including the completion bonus. Claim before the next event day.'
+    await interaction.response.send_message(embed=make_embed(f'🎯 Day {day+1} Daily Missions',message),view=DailyMissionClaimView(uid),ephemeral=True)
 
-@harvest.command(name='objectives',description='View and claim achievable daily farming missions')
+class DailyMissionClaimView(discord.ui.View):
+    def __init__(self, uid):
+        super().__init__(timeout=600)
+        self.uid=uid
+
+    @discord.ui.button(label='Claim Rewards',emoji='🪙',style=discord.ButtonStyle.success)
+    async def claim_rewards(self, interaction:discord.Interaction, button:discord.ui.Button):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message('These missions belong to another player.',ephemeral=True)
+            return
+        await show_objectives(interaction,claim=True)
+
+@harvest.command(name='objectives',description='View daily missions and claim rewards with the button')
 async def objectives(interaction:discord.Interaction):
     await show_objectives(interaction)
 
@@ -1130,7 +1149,7 @@ async def event_watcher():
                 msg=(f'🍁 **HARVEST HUSTLE — DAY {day}, SESSION {session} IS OPEN!**\n'
                      f'You have **one planting action per owned plot (10–20)** until {stamp(e["start_ts"]+(w+1)*WINDOW)}.\n'
                      'Open `/harvest farm` to plant, harvest, sell or upgrade. Only planting uses actions.\n'
-                     'Use `/harvest objectives` to claim today’s mission rewards.')
+                     'Use `/harvest objectives` and press **Claim Rewards** to collect today’s mission rewards.')
                 notice=('session',msg,True,w)
             elif w>=7 and not e['midweek_sent']:
                 ranks=board(e)
