@@ -704,7 +704,8 @@ async def before_watcher():
 @bot.event
 async def on_ready():
     logging.info('Logged in as %s',bot.user)
-    bot.tree.add_command(harvest)
+
+bot.tree.add_command(harvest)
 
 async def main():
     async with bot:
