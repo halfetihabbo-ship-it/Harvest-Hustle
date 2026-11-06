@@ -704,24 +704,25 @@ async def before_watcher():
 @bot.event
 async def on_ready():
     logging.info('Logged in as %s',bot.user)
+    bot.tree.add_command(harvest)
 
 async def main():
     async with bot:
         await bot.login(TOKEN)
 
         guild = discord.Object(id=GUILD_ID)
-
         bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
 
+        synced = await bot.tree.sync(guild=guild)
         print(f"Successfully synced {len(synced)} slash commands.")
+
+        bot.add_view(HarvestRolePanel())
+
+        if not event_watcher.is_running():
+            event_watcher.start()
 
         await bot.connect(reconnect=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
-asyncio.run(main())
-if __name__=='__main__':
     asyncio.run(main())
