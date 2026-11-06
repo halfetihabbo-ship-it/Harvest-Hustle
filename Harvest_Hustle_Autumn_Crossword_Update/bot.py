@@ -515,8 +515,7 @@ def role_panel_embed(signups: int, with_banner: bool = True):
         value=(
             '🌱 Plant and harvest crops\n'
             '💰 Sell produce and upgrade your farm\n'
-            '🏆 Climb the leaderboard over seven days\n\n'
-            'Claiming this role **does not start your farm**. Watch for the official game launch!'
+            '🏆 Climb the leaderboard over seven days'
         ), inline=False,
     )
     if with_banner:
@@ -577,6 +576,7 @@ class HarvestRolePanel(discord.ui.View):
 
 intents=discord.Intents.default()
 intents.members = True  # Enable Server Members Intent in Discord Developer Portal too.
+intents.message_content = True  # Enable Message Content Intent in Discord Developer Portal too.
 bot=commands.Bot(command_prefix='!',intents=intents)
 
 @bot.event
@@ -585,8 +585,12 @@ async def on_message(message: discord.Message):
     if message.guild is not None and message.channel.id == CHANNEL_ID and not message.author.bot:
         try:
             await message.delete()
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-            pass  # Missing Manage Messages, already removed, or Discord API error.
+        except discord.Forbidden:
+            logging.warning('Cannot delete message in game channel %s: missing Manage Messages permission', CHANNEL_ID)
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            logging.exception('Discord failed to delete message in game channel %s', CHANNEL_ID)
         return
     await bot.process_commands(message)
 
