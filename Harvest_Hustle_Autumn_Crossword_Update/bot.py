@@ -23,7 +23,7 @@ PANEL_BANNER = Path(__file__).with_name('harvest_hustle_role_banner.png')
 WINDOW = 12 * 3600
 DURATION = 14 * WINDOW
 FARMING_AT = int(datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc).timestamp())
-ACTIONS = 10
+ACTIONS = 10  # Starting actions; each purchased plot adds one action per session.
 START_COINS = 2000
 PLOTS = 10
 CROPS = {
@@ -169,6 +169,9 @@ def log_action(uid, e, action, detail, delta=0):
 def available_plots(p):
     return PLOTS + p['extra_plot']
 
+def planting_action_limit(p):
+    return available_plots(p)  # 10–20 actions, matching owned plots.
+
 def inventory_value(uid, p):
     multiplier = 1 + p['market'] * 0.06
     return sum(int(q['qty'] * CROPS[q['crop']]['sale'] * multiplier) for q in con.execute('SELECT * FROM inventory WHERE user_id=?',(uid,)))
@@ -310,7 +313,7 @@ class CropSelect(discord.ui.Select):
                 used={r['slot'] for r in con.execute('SELECT slot FROM plots WHERE user_id=?',(uid,))}
                 free=next((i for i in range(1,available_plots(p)+1) if i not in used),None)
                 c=CROPS[crop]
-                if p['actions_used']>=ACTIONS: msg='No planting actions left this session.'
+                if p['actions_used']>=planting_action_limit(p): msg='No planting actions left this session.'
                 elif free is None: msg='All plots are occupied. Harvest mature crops first.'
                 elif p['coins']<c['cost']: msg='Not enough coins for that seed.'
                 else:
@@ -449,7 +452,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
         embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 7**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
         embed.add_field(name='💰 Coins',value=str(p['coins']))
-        embed.add_field(name='🌱 Planting actions left',value=f'{max(0,ACTIONS-p["actions_used"])}/{ACTIONS}')
+        embed.add_field(name='🌱 Planting actions left',value=f'{max(0,planting_action_limit(p)-p["actions_used"])}/{planting_action_limit(p)}')
         embed.add_field(name='🏆 Farm value',value=f'{farm_value(uid,p,e):,}')
         next_reset=e['start_ts']+(w+1)*WINDOW
         if active(e): embed.add_field(name='⏳ Next planting reset',value=stamp(next_reset),inline=False)
@@ -615,14 +618,16 @@ async def role_panel(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     try:
         # Always post a fresh, visible panel. Never edit a previously posted message.
-        # Role panels never ping @everyone; hosts can announce separately.
+        # Only the first role panel tags @everyone; subsequent posts stay quiet.
+        previous = official_con.execute('SELECT message_id FROM role_panel WHERE id=1').fetchone()
         has_banner = PANEL_BANNER.is_file()
-        content = (
+        mention_everyone = previous is None
+        content = ('@everyone ' if mention_everyone else '') + (
             '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
             '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
             '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
         kwargs = dict(content=content, embed=role_panel_embed(role_signup_count(interaction.guild), with_banner=has_banner),
-                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions.none())
+                      view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=mention_everyone, roles=False, users=False))
         if has_banner:
             kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await channel.send(**kwargs)
@@ -632,7 +637,7 @@ async def role_panel(interaction: discord.Interaction):
         official_con.execute('INSERT OR REPLACE INTO role_panel_messages(message_id, channel_id) VALUES(?, ?)', (message.id, channel.id))
         official_con.commit()
         await interaction.followup.send(
-            f'🍂 A NEW role panel was posted in {channel.mention}. No @everyone ping was sent.', ephemeral=True)
+            f'🍂 A NEW role panel was posted in {channel.mention}. ' + ('@everyone was included.' if mention_everyone else 'No repeat @everyone ping was sent.'), ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
             'I need View Channel, Send Messages, Embed Links and Attach Files in the role-panel channel.', ephemeral=True)
@@ -866,7 +871,7 @@ async def leaderboard(interaction:discord.Interaction):
 async def rules(interaction:discord.Interaction):
     crops='\n'.join(f"{v['name']}: seed {v['cost']}c → sells {v['sale']}c · grows {v['hours']} hours" for v in CROPS.values())
     e=make_embed('📖 Harvest Hustle Rules',
-        '**Join using the host-posted Join button; late joining is allowed while the event is active.** Seven days, fourteen 12-hour sessions. You get **10 planting actions per session**; unused actions do not roll over. Each player starts with **2,000 coins and 10 plots**.\n\n'
+        '**Join using the host-posted Join button; late joining is allowed while the event is active.** Seven days, fourteen 12-hour sessions. You get **one planting action per owned plot per session (10–20)**; unused actions do not roll over. Each player starts with **2,000 coins and 10 plots**.\n\n'
         '**Plant**: one planting action and the seed cost per plot. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
@@ -886,14 +891,14 @@ async def harvest_help(interaction: discord.Interaction):
         '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**.\n'
         '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
         '5. Click **Sell Produce** to sell everything in your inventory for coins. Harvesting and selling are **free actions**.\n\n'
-        '**Starting resources:** 2,000 in-game coins, 10 plots and **10 planting actions per 12-hour session**. Unused actions do not carry over. Crops grow in real time, independent of action resets.\n\n'
+        '**Starting resources:** 2,000 in-game coins, 10 plots and **10 planting actions per 12-hour session**, increasing by one action for each extra plot purchased (up to 20). Unused actions do not carry over. Crops grow in real time, independent of action resets.\n\n'
         '**Private updates:** Farm actions appear privately in the game channel. Discord controls how long ephemeral messages stay visible. Use **Save Farm to DMs** for a lasting copy.\n\n'
         '**Crop readiness:** The bot displays relative ready times and attempts to DM you when crops mature. If DMs are disabled, check `/harvest farm` yourself. Ready crops remain available until harvested.')
     crops = '\n'.join(f"{v['name']} — **{v['hours']}h** · Seed **{v['cost']}c** · Sell **{v['sale']}c**" for v in CROPS.values())
     economy = make_embed('🌱 Crops, Upgrades & Daily Missions',
         '**Crop guide**\n' + crops + '\n\n'
         '**Expand your farm**\n'
-        '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space, not an extra planting action. Resale value: **50% of purchase price**.\n'
+        '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space **and one planting action per 12-hour session**. Resale value: **50% of purchase price**.\n'
         '🛒 Market Stall: **1,200c** per level, up to **2 levels**. Each level increases produce sale prices by **6%** (maximum +12%). Resale value: **600c** per level.\n\n'
         '**Three daily missions** (claim via `/harvest objectives`)\n'
         '• Plant 2 crops: **+50c**\n'
@@ -1136,7 +1141,7 @@ async def event_watcher():
             if e['last_session_notice']<w:
                 day=w//2+1; session=w%2+1
                 msg=(f'🍁 **HARVEST HUSTLE — DAY {day}, SESSION {session} IS OPEN!**\n'
-                     f'You have **10 planting actions** until {stamp(e["start_ts"]+(w+1)*WINDOW)}.\n'
+                     f'You have **one planting action per owned plot (10–20)** until {stamp(e["start_ts"]+(w+1)*WINDOW)}.\n'
                      'Open `/harvest farm` to plant, harvest, sell or upgrade. Only planting uses actions.\n'
                      'Use `/harvest objectives` to claim today’s mission rewards.')
                 notice=('session',msg,True,w)
@@ -1243,7 +1248,7 @@ class HarvestTestView(discord.ui.View):
         embed = make_embed('🧪 Harvest Hustle — PRIVATE TEST SANDBOX',
                            f'**Day {self.test_hour // 24 + 1} · Session {self.test_hour // 12 % 2 + 1}** (of 14) · Hour {self.test_hour}/168\n'
                            f'**Coins:** {self.coins:,} · **Farm value:** {self.value():,}\n'
-                           f'**Planting actions:** {self.actions}/{ACTIONS} used\n'
+                           f'**Planting actions:** {self.actions}/{PLOTS + self.extra_plot} used\n'
                            f'**Plots:** {PLOTS + self.extra_plot} · **Market stalls:** {self.market}\n'
                            f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
@@ -1266,7 +1271,7 @@ class HarvestTestView(discord.ui.View):
         free = next((i for i in range(1, PLOTS + self.extra_plot + 1) if i not in self.plots), None)
         if self.test_hour >= 168:
             msg = 'Test has ended. Reset to start again.'
-        elif self.actions >= ACTIONS:
+        elif self.actions >= PLOTS + self.extra_plot:
             msg = 'No planting actions left; advance to the next session.'
         elif free is None:
             msg = 'All plots are occupied. Harvest mature crops first.'
