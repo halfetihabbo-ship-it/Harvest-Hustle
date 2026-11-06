@@ -471,6 +471,74 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
 official_con.execute('CREATE TABLE IF NOT EXISTS role_panel(id INTEGER PRIMARY KEY CHECK(id=1), message_id INTEGER NOT NULL)')
 official_con.commit()
 
+# Store every panel so role sign-ups can refresh all visible counters.
+official_con.execute('CREATE TABLE IF NOT EXISTS role_panel_messages(message_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)')
+official_con.commit()
+
+
+def role_signup_count(guild: discord.Guild) -> int:
+    role = guild.get_role(ROLE_ID)
+    return len(role.members) if role else 0
+
+
+def role_panel_embed(signups: int, with_banner: bool = True):
+    embed = discord.Embed(
+        title='🍂 HARVEST HUSTLE | AUTUMN SHOWDOWN',
+        description=(
+            '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!**\n'
+            'Our next big Secret Service Discord game is here. '
+            'Grow your farm, earn coins and compete for the top spot!'
+        ),
+        color=discord.Color.from_rgb(170, 112, 45),
+    )
+    embed.add_field(
+        name='🏆 375 CREDITS + 3 HC BOXES TO WIN',
+        value=(
+            '🥇 **1st — 200 credits + HC Box**\n'
+            '🥈 **2nd — 100 credits + HC Box**\n'
+            '🥉 **3rd — 75 credits + HC Box**'
+        ), inline=False,
+    )
+    embed.add_field(
+        name='📅 EVENT DATES',
+        value='🟢 **Starts:** 8 November, 12:00 AM GMT\n🔴 **Ends:** 15 November, 12:00 AM GMT',
+        inline=False,
+    )
+    embed.add_field(
+        name=f'👥 {signups} MEMBERS SIGNED UP',
+        value='Click **Join / Leave Harvest Hustle** below to claim your event role!',
+        inline=False,
+    )
+    embed.add_field(
+        name='🚜 HOW IT WORKS',
+        value=(
+            '🌱 Plant and harvest crops\n'
+            '💰 Sell produce and upgrade your farm\n'
+            '🏆 Climb the leaderboard over seven days\n\n'
+            'Claiming this role **does not start your farm**. Watch for the official game launch!'
+        ), inline=False,
+    )
+    if with_banner:
+        embed.set_image(url='attachment://harvest_hustle_role_banner.png')
+    embed.set_footer(text='🌻 7 DAYS • 3 WINNERS • 1 HARVEST CHAMPION')
+    return embed
+
+
+async def refresh_role_panel_counts(guild: discord.Guild):
+    count = role_signup_count(guild)
+    records = official_con.execute('SELECT message_id, channel_id FROM role_panel_messages').fetchall()
+    for record in records:
+        channel = guild.get_channel(record['channel_id'])
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            message = await channel.fetch_message(record['message_id'])
+            has_banner = bool(message.embeds and message.embeds[0].image and message.embeds[0].image.url)
+            await message.edit(embed=role_panel_embed(count, with_banner=has_banner))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            continue
+
+
 class HarvestRolePanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -495,49 +563,19 @@ class HarvestRolePanel(discord.ui.View):
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason='Harvest Hustle self-service role panel')
-                await interaction.response.send_message('🍂 You have left the Harvest Hustle notification role. You can rejoin anytime.', ephemeral=True)
+                reply = '🍂 You have left the Harvest Hustle role. You can rejoin anytime.'
             else:
                 await member.add_roles(role, reason='Harvest Hustle self-service role panel')
-                await interaction.response.send_message('🌾 You now have the Harvest Hustle role! You will receive event announcement pings. Watch the main game channel for the host-posted join button.', ephemeral=True)
+                reply = '🌾 You now have the Harvest Hustle role! Watch for the official game launch.'
+            await interaction.response.send_message(reply, ephemeral=True)
+            await refresh_role_panel_counts(interaction.guild)
         except discord.Forbidden:
-            await interaction.response.send_message('I cannot manage that role. Please give me **Manage Roles** and move my highest role **above** the Harvest Hustle role.', ephemeral=True)
+            await interaction.response.send_message('I need **Manage Roles** and my highest role must be **above** the event role.', ephemeral=True)
         except discord.HTTPException:
             await interaction.response.send_message('Discord could not update your role. Please try again.', ephemeral=True)
 
-
-def role_panel_embed(with_banner=True):
-    embed = discord.Embed(
-        title='🍂🌾 HARVEST HUSTLE — THE ULTIMATE AUTUMN SHOWDOWN!',
-        description=(
-            '🎮 **ANOTHER DISCORD GAME IS HERE!** 🎮\\n\\n'
-            'After all the excitement of our **Trick or Treat** event, '
-            'we’re back with another **HUGE Discord competition!** 🔥\\n\\n'
-            '🚜 **THIS TIME, WE’RE HEADING TO THE FARM!**\\n'
-            'Plant crops 🌱, harvest produce 🧺, earn coins 💰 and upgrade '
-            'your farm to climb the leaderboard. You have **7 DAYS** to '
-            'build your farming empire — every decision counts!\\n\\n'
-            '🏆 **HUGE PRIZES UP FOR GRABS!** 🏆\\n\\n'
-            '🥇 **1ST PLACE — 200 HABBO CREDITS + HC BOX** 👑\\n\\n'
-            '🥈 **2ND PLACE — 100 HABBO CREDITS + HC BOX**\\n\\n'
-            '🥉 **3RD PLACE — 75 HABBO CREDITS + HC BOX**\\n\\n'
-            '💰 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** 💰\\n\\n'
-            '📅 **MARK YOUR CALENDARS!**\\n'
-            '🟢 **STARTS:** Sunday, 8 November 2026 — **12:00 AM GMT**\\n'
-            '🔴 **ENDS:** Sunday, 15 November 2026 — **12:00 AM GMT**\\n\\n'
-            '🍁 **READY TO JOIN THE FUN?**\\n'
-            '👇 **CLICK THE BUTTON BELOW TO CLAIM YOUR HARVEST HUSTLE ROLE!**\\n'
-            'Get access to the event channels and watch for the separate '
-            '**Join Harvest Hustle** announcement when the game launches.\\n\\n'
-            '📖 Want a head start? Check out `/harvest help`!'
-        ),
-        color=discord.Color.from_rgb(160, 104, 49)
-    )
-    if with_banner:
-        embed.set_image(url='attachment://harvest_hustle_role_banner.png')
-    embed.set_footer(text='🌻 7 DAYS. 3 WINNERS. ONE HARVEST CHAMPION. Will it be you?')
-    return embed
-
 intents=discord.Intents.default()
+intents.members = True  # Enable Server Members Intent in Discord Developer Portal too.
 bot=commands.Bot(command_prefix='!',intents=intents)
 harvest=app_commands.Group(name='harvest',description='Harvest Hustle farming competition')
 
@@ -568,13 +606,15 @@ async def role_panel(interaction: discord.Interaction):
             '🎮 **TRICK OR TREAT WAS JUST THE BEGINNING!** 🍂 '
             '**HARVEST HUSTLE** is coming! 🏆 **375 HABBO CREDITS + 3 HC BOXES TO BE WON!** '
             '🚜 Claim your event role below and get ready for **8 NOVEMBER, 12 AM GMT!**')
-        kwargs = dict(content=content, embed=role_panel_embed(with_banner=has_banner),
+        kwargs = dict(content=content, embed=role_panel_embed(role_signup_count(interaction.guild), with_banner=has_banner),
                       view=HarvestRolePanel(), allowed_mentions=discord.AllowedMentions(everyone=mention_everyone, roles=False, users=False))
         if has_banner:
             kwargs['file'] = discord.File(PANEL_BANNER, filename='harvest_hustle_role_banner.png')
         message = await channel.send(**kwargs)
         official_con.execute('INSERT INTO role_panel(id,message_id) VALUES(1,?) '
                     'ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id', (message.id,))
+        official_con.commit()
+        official_con.execute('INSERT OR REPLACE INTO role_panel_messages(message_id, channel_id) VALUES(?, ?)', (message.id, channel.id))
         official_con.commit()
         await interaction.followup.send(
             f'🍂 A NEW role panel was posted in {channel.mention}. ' + ('@everyone was included.' if mention_everyone else 'No repeat @everyone ping was sent.'), ephemeral=True)
@@ -584,6 +624,14 @@ async def role_panel(interaction: discord.Interaction):
             'to mention @everyone in the event channel.', ephemeral=True)
     except discord.HTTPException:
         await interaction.followup.send('Discord could not post the role panel. Please retry.', ephemeral=True)
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    before_has = any(r.id == ROLE_ID for r in before.roles)
+    after_has = any(r.id == ROLE_ID for r in after.roles)
+    if before_has != after_has:
+        await refresh_role_panel_counts(after.guild)
+
 
 class HarvestRegistrationView(discord.ui.View):
     def __init__(self):
