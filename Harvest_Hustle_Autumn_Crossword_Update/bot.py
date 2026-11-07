@@ -1,5 +1,4 @@
 # Harvest Hustle deployment update
-#test
 import os
 import sqlite3
 import asyncio
@@ -204,16 +203,27 @@ for schema_row in official_con.execute("SELECT type,name,sql FROM sqlite_master 
     if schema_row['name'] in ('harvest_runtime', 'harvest_migrations'):
         continue
     test_con.execute(schema_row['sql'].replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1)) if schema_row['sql'].startswith('CREATE TABLE ') else None
-# Apply additive plot migrations to an existing live-test database as well.
-existing_test_cols={r['name'] for r in test_con.execute('PRAGMA table_info(plots)')}
-for column, definition in (
-    ('potion_used','INTEGER NOT NULL DEFAULT 0'),
-    ('potion_seconds','INTEGER NOT NULL DEFAULT 0'),
-    ('pest_penalty','INTEGER NOT NULL DEFAULT 0'),
-    ('breeze_bonus','INTEGER NOT NULL DEFAULT 0'),
-):
-    if column not in existing_test_cols:
-        test_con.execute(f'ALTER TABLE plots ADD COLUMN {column} {definition}')
+# Synchronise ALL additive columns, not just new plot features. Older test DBs
+# may lack event registration fields, player counters or watering timestamps.
+for table in ('event', 'players', 'plots', 'inventory', 'transactions',
+              'objective_claims', 'watering_alerts', 'harvest_alerts',
+              'farm_cycles', 'delivery_orders', 'delivery_claims',
+              'pest_alerts', 'potions', 'pest_cycles'):
+    official_columns = official_con.execute(f'PRAGMA table_info({table})').fetchall()
+    test_columns = {r['name'] for r in test_con.execute(f'PRAGMA table_info({table})')}
+    for col in official_columns:
+        name = col['name']
+        if name in test_columns:
+            continue
+        # All newly added columns in the live schema are optional or have defaults.
+        # Reproduce the column definition including its default and NOT NULL flag.
+        definition = col['type'] or 'TEXT'
+        if col['notnull']:
+            definition += ' NOT NULL'
+        if col['dflt_value'] is not None:
+            definition += f" DEFAULT {col['dflt_value']}"
+        test_con.execute(f'ALTER TABLE {table} ADD COLUMN "{name}" {definition}')
+        logging.info('Migrated test database: %s.%s', table, name)
 test_con.commit()
 
 def test_mode_active():
@@ -936,13 +946,14 @@ def registration_embed(live_test=False):
 @harvest.command(name='start-test', description='Host only: start a fresh live test in this channel')
 async def start_test(interaction: discord.Interaction):
     global con
+    # Acknowledge Discord immediately; DB operations and channel posting can take time.
+    await interaction.response.defer(ephemeral=True)
     if not is_host(interaction):
-        await interaction.response.send_message('Host only.', ephemeral=True)
+        await interaction.followup.send('Host only.', ephemeral=True)
         return
     if not isinstance(interaction.channel, discord.TextChannel):
-        await interaction.response.send_message('Run this in your test text channel.', ephemeral=True)
+        await interaction.followup.send('Run this in your test text channel.', ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     async with lock:
         if test_mode_active():
             await interaction.followup.send('A test is already running. Use `/harvest end-test` first.', ephemeral=True)
@@ -1937,6 +1948,21 @@ async def main():
 
         await bot.connect(reconnect=True)
 
+
+
+
+# Surface command failures instead of leaving Discord showing a generic timeout.
+@start_test.error
+async def start_test_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logging.error('Harvest start-test failed', exc_info=(type(error), error, error.__traceback__))
+    message = '❌ Could not start the test. Check the Railway deployment logs for “Harvest start-test failed”. Official farm data was not reset.'
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        logging.exception('Unable to send start-test error notification')
 
 if __name__ == "__main__":
     asyncio.run(main())
