@@ -1367,14 +1367,25 @@ def economy_announcement(row, forecast):
     }
     weather = row['weather']
     market = f'{float(row["market_pct"]):+.0%}'
-    delivery = (f'{forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} '
-                f'({forecast["kind"]} order)') if forecast else 'Forecast pending'
+    if forecast:
+        crop = CROPS[forecast['crop']]
+        hours = {'quick': 12, 'standard': 18, 'premium': 24}[forecast['kind']]
+        delivery = (f'**{forecast["qty"]} × {crop["name"]}** ({forecast["kind"].title()} order)\n'
+                    f'⏳ **Time to complete:** {hours} hours after the delivery opens\n'
+                    f'📅 **Opens:** <t:{int(forecast["starts"])}:F>\n'
+                    f'🏁 **Deadline:** <t:{int(forecast["ends"])}:F> '
+                    f'(<t:{int(forecast["ends"])}:R>)\n'
+                    f'🌱 **Normal crop growth:** {crop["hours"]} hours '
+                    f'(before weather and watering effects)\n'
+                    f'📢 **Prepare now!** Harvest the required crops before the deadline.')
+    else:
+        delivery = 'Forecast pending'
     return (f'🌾 **HARVEST HUSTLE — 6-HOUR FARM UPDATE**\n\n'
             f'🌦️ **Weather:** {weather.replace("_", " ").title()}\n'
             f'{weather_details.get(weather, "Normal growing conditions.")}\n\n'
             f'📈 **Crop Market:** {CROPS[row["market_crop"]]["name"]} '
             f'**{market}** selling price for the next 6 hours.\n\n'
-            f'🚚 **Next Harvest Delivery (in 6 hours):** {delivery}\n'
+            f'🚚 **Next Harvest Delivery (in 6 hours):**\n{delivery}\n'
             f'Active delivery orders can be viewed through **/harvest farm → Harvest Deliveries**.\n\n'
             f'🐛 **Pest Alerts:** Affected farmers receive a private DM. '
             f'Use **Remove Pests** to treat crops for free.\n'
