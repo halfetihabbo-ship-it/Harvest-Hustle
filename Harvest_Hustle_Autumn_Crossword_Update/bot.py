@@ -18,6 +18,8 @@ HOST_IDS = {int(x.strip()) for x in os.environ.get('HOST_IDS', '1501587787294703
 CHANNEL_ID = int(os.environ.get('EVENT_CHANNEL_ID', '1567980502965551144'))
 ROLE_PANEL_CHANNEL_ID = int(os.environ.get('ROLE_PANEL_CHANNEL_ID', str(CHANNEL_ID)))
 ROLE_ID = int(os.environ.get('EVENT_ROLE_ID', '1567982021106602065'))
+ANNOUNCEMENT_CHANNEL_ID = int(os.environ.get('ANNOUNCEMENT_CHANNEL_ID', '1568316136104140810'))
+ANNOUNCEMENT_ROLE_ID = int(os.environ.get('ANNOUNCEMENT_ROLE_ID', '1567982021106602065'))
 DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
 WINDOW = 12 * 3600
 DURATION = 14 * WINDOW
@@ -1355,6 +1357,74 @@ async def history(interaction:discord.Interaction,member:discord.User):
     desc='\n'.join(f'{stamp(r["ts"])} · {r["action"]} ({r["detail"]}) · {r["coin_change"]:+,}c' for r in rows) or 'No transactions.'
     await interaction.response.send_message(embed=make_embed(f'📋 Transactions — {member.display_name}',desc[:4000]),ephemeral=True)
 
+def economy_announcement(row, forecast):
+    weather_details = {
+        'sun': '☀️ Sunshine — newly planted crops grow 10% faster.',
+        'rain': '🌧️ Rainfall — thirsty crops are watered automatically.',
+        'breeze': '🍃 Autumn Breeze — newly planted crops earn a 5% sale bonus.',
+        'clear': '🌤️ Clear Skies — normal growing conditions.',
+        'irrigation': '💦 Irrigation — thirsty crops are watered automatically.',
+    }
+    weather = row['weather']
+    market = f'{float(row["market_pct"]):+.0%}'
+    delivery = (f'{forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} '
+                f'({forecast["kind"]} order)') if forecast else 'Forecast pending'
+    return (f'🌾 **HARVEST HUSTLE — 6-HOUR FARM UPDATE**\n\n'
+            f'🌦️ **Weather:** {weather.replace("_", " ").title()}\n'
+            f'{weather_details.get(weather, "Normal growing conditions.")}\n\n'
+            f'📈 **Crop Market:** {CROPS[row["market_crop"]]["name"]} '
+            f'**{market}** selling price for the next 6 hours.\n\n'
+            f'🚚 **Next Harvest Delivery (in 6 hours):** {delivery}\n'
+            f'Active delivery orders can be viewed through **/harvest farm → Harvest Deliveries**.\n\n'
+            f'🐛 **Pest Alerts:** Affected farmers receive a private DM. '
+            f'Use **Remove Pests** to treat crops for free.\n'
+            f'💧 **Crop Care:** Rainfall and irrigation water eligible thirsty crops automatically.\n\n'
+            f'⏰ Next update in **6 hours**. Happy harvesting!')
+
+async def send_economy_announcement(message):
+    if not ANNOUNCEMENT_CHANNEL_ID:
+        logging.error('ANNOUNCEMENT_CHANNEL_ID is not configured')
+        return False
+    channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ANNOUNCEMENT_CHANNEL_ID)
+        except (discord.Forbidden, discord.HTTPException):
+            logging.exception('Cannot access Harvest announcement channel %s', ANNOUNCEMENT_CHANNEL_ID)
+            return False
+    try:
+        await channel.send(
+            f'<@&{ANNOUNCEMENT_ROLE_ID}>\n{message}' if ANNOUNCEMENT_ROLE_ID else message,
+            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=ANNOUNCEMENT_ROLE_ID)] if ANNOUNCEMENT_ROLE_ID else [], users=False, everyone=False),
+        )
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        logging.exception('Unable to post Harvest update to channel %s', ANNOUNCEMENT_CHANNEL_ID)
+        return False
+
+@harvest.command(name='announcement-test', description='Host only: privately preview the six-hour announcement (no ping or channel post)')
+async def announcement_test(interaction: discord.Interaction):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    async with lock:
+        e = event()
+        if e is None:
+            await interaction.response.send_message('No Harvest event is scheduled.', ephemeral=True)
+            return
+        n = cycle_number(e) if active(e) else 0
+        row = ensure_cycle(e, n)
+        ensure_delivery(e, n+1)
+        forecast = con.execute('SELECT * FROM delivery_orders WHERE cycle=?', (n+1,)).fetchone()
+        con.commit()
+        preview = economy_announcement(row, forecast)
+    await interaction.response.send_message(
+        f'🔒 **PRIVATE ANNOUNCEMENT PREVIEW — ONLY YOU CAN SEE THIS**\n'
+        f'No message has been sent to <#{ANNOUNCEMENT_CHANNEL_ID}> and no role has been pinged.\n\n'
+        f'{preview}', ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
 async def send_announcement_checked(message,ping=False):
     if not CHANNEL_ID: return False
     channel=bot.get_channel(CHANNEL_ID)
@@ -1466,19 +1536,18 @@ async def economy_watcher():
                 con.execute('UPDATE plots SET pest_penalty=1 WHERE user_id=? AND slot=?',(uid,r['slot']))
                 con.execute('INSERT OR IGNORE INTO pest_alerts(user_id,slot,planted_ts) VALUES(?,?,?)',(uid,r['slot'],r['planted_ts']))
         announced=bool(row['announced'])
-        if not announced:con.execute('UPDATE farm_cycles SET announced=1 WHERE cycle=?',(n,))
         alerts=list(con.execute('SELECT user_id,COUNT(*) AS qty FROM pest_alerts WHERE alerted=0 GROUP BY user_id'))
         con.execute('UPDATE pest_alerts SET alerted=1 WHERE alerted=0')
         forecast=con.execute('SELECT * FROM delivery_orders WHERE cycle=?',(n+1,)).fetchone()
         con.commit()
     if not announced:
-        pct=f'{row["market_pct"]:+.0%}'
-        msg=(f'🌦️ **HARVEST WEATHER — {row["weather"].upper()}** (6 hours)\n'
-             f'📈 **MARKET:** {CROPS[row["market_crop"]]["name"]} {pct} sale price.\n'
-             '☀️ Sunshine: new crops grow 10% faster. 🌧️ Rain/Irrigation: thirsty crops watered automatically. 🍃 Breeze: new crops get +5% harvest bonus.\n'
-             f'🚚 **NEXT DELIVERY IN 6 HOURS:** {forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} ({forecast["kind"]}).\n'
-             'Open **/harvest farm** → **Harvest Deliveries** for currently active orders.')
-        await send_announcement_checked(msg)
+        # Only mark the cycle as announced after Discord confirms the post.
+        # A failed send is retried on the next watcher iteration.
+        sent = await send_economy_announcement(economy_announcement(row, forecast))
+        if sent:
+            async with lock:
+                con.execute('UPDATE farm_cycles SET announced=1 WHERE cycle=?', (n,))
+                con.commit()
     for r in alerts:
         try:
             user=bot.get_user(r['user_id']) or await bot.fetch_user(r['user_id'])
