@@ -553,26 +553,43 @@ async def do_pests(interaction, uid):
     await show_farm(interaction,latest_action=f'🐛 Removed pests from {len(rows)} crops for free.',edit_existing=True)
 
 async def do_potion(interaction, uid):
+    # Calculate the reduction from the exact same authoritative timestamp
+    # that the farm panel and harvesting checks use.
     async with lock:
         e=event(); msg='The game is not active.'
         if active(e) and player(uid):
-            now=int(time.time());day=min(6,(now-e['start_ts'])//86400)
+            now=int(time.time()); day=min(6,(now-e['start_ts'])//86400)
             p=player(uid)
             bought=con.execute('SELECT bought FROM potions WHERE user_id=? AND day=?',(uid,day)).fetchone()
-            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,)) if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
-            if bought and bought['bought']>=2:msg='You have already purchased 2 potions today.'
-            elif p['coins']<POTION_PRICE:msg='You need 400 coins for a Growth Potion.'
-            elif not rows:msg='No eligible crops: potions require at least 1 hour remaining and can only be used once per crop.'
+            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,))
+                  if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
+            if bought and bought['bought']>=2:
+                msg='You have already purchased 2 Growth Potions today.'
+            elif p['coins']<POTION_PRICE:
+                msg='You need 400 coins for a Growth Potion.'
+            elif not rows:
+                msg='No eligible crops: at least 1 hour must remain and each crop can only receive one potion.'
             else:
                 savings=[]
                 for r in rows:
-                    reduction=int((crop_ready_ts(r,e)-now)*0.20)
-                    savings.append((r['slot'],reduction))
-                    con.execute('UPDATE plots SET potion_used=1,potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',(reduction,uid,r['slot']))
+                    before_ts=crop_ready_ts(r,e)
+                    before_remaining=max(0,before_ts-now)
+                    reduction=max(1,int(before_remaining*0.20))
+                    con.execute('UPDATE plots SET potion_used=1, potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',
+                                (reduction,uid,r['slot']))
+                    # Read the persisted plot again: display and harvest checks must agree.
+                    updated=con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,r['slot'])).fetchone()
+                    after_ts=crop_ready_ts(updated,e)
+                    savings.append((r['slot'],before_ts,after_ts,before_ts-after_ts))
                 con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(POTION_PRICE,uid))
                 con.execute('INSERT INTO potions(user_id,day,bought) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET bought=bought+1',(uid,day))
                 log_action(uid,e,'growth_potion',f'{len(rows)} crops',-POTION_PRICE)
-                msg='🧪 Potion applied to '+str(len(rows))+' crops (400c). Saved: '+', '.join(f'plot {slot}: {seconds//60}m' for slot,seconds in savings)+'. See updated timers below.'
+                con.commit()
+                def fmt(seconds):
+                    minutes=(max(0,seconds)+59)//60
+                    return f'{minutes//60}h {minutes%60:02d}m'
+                msg=('🧪 **Growth Potion applied** (400c) to '+str(len(rows))+' crops.\n'+
+                     '\n'.join(f'**Plot {slot}:** {fmt(before-now)} → **{fmt(after-now)}** (saved {saved//60}m)' for slot,before,after,saved in savings))
             con.commit()
     await show_farm(interaction,latest_action=msg,edit_existing=True)
 
@@ -642,7 +659,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
                 hours_left, minutes_left = divmod((remaining + 59)//60, 60)
                 duration = f'{hours_left}h {minutes_left:02d}m' if hours_left else f'{minutes_left}m'
                 potion_mark = ' 🧪 Potion applied' if r['potion_used'] else ''
-                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready**' if remaining==0 else f'⏳ **{duration} left** · <t:{ready_ts}:t>' + potion_mark + care))
+                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready**' if remaining==0 else f'⏳ **{duration} left** · ready <t:{ready_ts}:t>' + potion_mark + care))
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
         embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 7**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
         condition=current_conditions(e)
