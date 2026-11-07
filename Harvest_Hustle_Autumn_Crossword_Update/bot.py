@@ -32,6 +32,66 @@ CROPS = {
     'pumpkin': {'name':'🎃 Pumpkins', 'cost':250, 'sale':540, 'hours':8},
     'gourd': {'name':'🍂 Golden Gourds', 'cost':250, 'sale':500, 'hours':12},
 }
+# Six-hour economy: deterministic time windows, with persisted market/weather rolls.
+import random
+import math
+WEATHER = ('sun', 'rain', 'breeze', 'clear', 'irrigation')
+MARKET_MODIFIERS = (-0.10, -0.10, -0.10, -0.05, 0.0, 0.10, 0.10, 0.15)  # zero-average market; -10% to +15%
+POTION_PRICE = 400
+
+def cycle_number(e, now=None):
+    return max(0, (int(time.time() if now is None else now)-e['start_ts']) // 21600)
+
+def current_conditions(e):
+    n=cycle_number(e)
+    row=con.execute('SELECT * FROM farm_cycles WHERE cycle=?',(n,)).fetchone()
+    return row
+
+def market_modifier(e, crop):
+    row=current_conditions(e)
+    return float(row['market_pct']) if row and row['market_crop']==crop else 0.0
+
+def sale_unit(e, p, crop):
+    return int(round(CROPS[crop]['sale'] * (1+p['market']*0.06) * (1+market_modifier(e,crop))))
+
+def ensure_cycle(e, n):
+    row=con.execute('SELECT * FROM farm_cycles WHERE cycle=?',(n,)).fetchone()
+    if row:return row
+    # Stable, fair shared conditions across all players; no rerolls after restart.
+    rng=random.Random(f'{e["start_ts"]}:harvest:{n}')
+    weather=rng.choice(WEATHER)
+    crop=rng.choice(list(CROPS))
+    pct=rng.choice(MARKET_MODIFIERS)
+    con.execute('INSERT INTO farm_cycles(cycle,weather,market_crop,market_pct) VALUES(?,?,?,?)',(n,weather,crop,pct))
+    return con.execute('SELECT * FROM farm_cycles WHERE cycle=?',(n,)).fetchone()
+
+def active_orders(e, now=None):
+    now=int(time.time() if now is None else now)
+    return list(con.execute('SELECT * FROM delivery_orders WHERE starts<=? AND ends>? ORDER BY starts',(now,now)))
+
+def ensure_delivery(e,n):
+    if con.execute('SELECT 1 FROM delivery_orders WHERE cycle=?',(n,)).fetchone():return
+    rng=random.Random(f'{e["start_ts"]}:delivery:{n}')
+    kind=('quick','standard','premium')[n%3]
+    options={'quick':('carrot','corn'),'standard':('apple','pumpkin'),'premium':('gourd','pumpkin')}
+    crop=rng.choice(options[kind]);qty={'quick':4,'standard':3,'premium':2}[kind]
+    duration={'quick':12,'standard':18,'premium':24}[kind]*3600
+    starts=e['start_ts']+n*21600
+    reward=int(round(qty*CROPS[crop]['sale']*1.18))
+    con.execute('INSERT INTO delivery_orders(cycle,starts,ends,kind,crop,qty,reward) VALUES(?,?,?,?,?,?,?)',(n,starts,starts+duration,kind,crop,qty,reward))
+
+def weather_growth_factor(e, ts):
+    n=max(0,(ts-e['start_ts'])//21600)
+    row=con.execute('SELECT weather FROM farm_cycles WHERE cycle=?',(n,)).fetchone()
+    return 0.9 if row and row['weather']=='sun' else 1.0
+
+def apply_automatic_irrigation(e, now):
+    row=current_conditions(e)
+    if not row or row['weather'] not in ('rain','irrigation'):return
+    for r in con.execute('SELECT * FROM plots WHERE boost_used=0'):
+        if crop_thirst_ts(r,e)<=now and crop_ready_ts(r,e)>now:
+            con.execute('UPDATE plots SET boost_used=1 WHERE user_id=? AND slot=?',(r['user_id'],r['slot']))
+
 UPGRADES = {'extra_plot': {'name':'🌱 Extra Plot', 'cost':500, 'max':10, 'resale':250}, 'market': {'name':'🛒 Market Stall', 'cost':1200, 'max':2, 'resale':600}}
 
 def plot_price(extra_owned):
@@ -45,7 +105,11 @@ def crop_ready_ts(plot, event_row):
     # Backward compatibility for farms planted before the timestamp migration.
     if not planted:
         planted = event_row['start_ts'] + plot['planted_window'] * WINDOW
-    return int(planted) + CROPS[plot['crop']]['hours'] * 3600 - plot['boost_seconds']
+    return int(planted) + max(60, int(CROPS[plot['crop']]['hours'] * 3600 * (1.0 if plot['boost_used'] else 1.25) * (0.9 if plot['boost_seconds']==1 else 1.0) * (1.15 if plot['pest_penalty'] else 1.0)) - int(plot['potion_seconds']))
+
+def crop_thirst_ts(plot, event_row):
+    planted = plot['planted_ts'] or event_row['start_ts'] + plot['planted_window'] * WINDOW
+    return int(planted) + int(CROPS[plot['crop']]['hours'] * 3600 * 0.5)
 
 # All game changes occur under one lock and are committed together.
 lock = asyncio.Lock()
@@ -87,10 +151,26 @@ con.execute('''CREATE TABLE IF NOT EXISTS objective_claims (
     user_id INTEGER NOT NULL, day INTEGER NOT NULL, objective TEXT NOT NULL,
     PRIMARY KEY(user_id,day,objective)
 )''')
+con.execute('''CREATE TABLE IF NOT EXISTS watering_alerts (
+    user_id INTEGER NOT NULL, slot INTEGER NOT NULL, planted_ts INTEGER NOT NULL,
+    PRIMARY KEY(user_id, slot, planted_ts)
+)''')
 con.execute('''CREATE TABLE IF NOT EXISTS harvest_alerts (
     user_id INTEGER NOT NULL, ready_ts INTEGER NOT NULL,
     PRIMARY KEY(user_id, ready_ts)
 )''')
+con.executescript("""
+CREATE TABLE IF NOT EXISTS farm_cycles(cycle INTEGER PRIMARY KEY, weather TEXT NOT NULL, market_crop TEXT NOT NULL, market_pct REAL NOT NULL, announced INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS delivery_orders(cycle INTEGER PRIMARY KEY, starts INTEGER NOT NULL, ends INTEGER NOT NULL, kind TEXT NOT NULL, crop TEXT NOT NULL, qty INTEGER NOT NULL, reward INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS delivery_claims(user_id INTEGER NOT NULL, cycle INTEGER NOT NULL, PRIMARY KEY(user_id,cycle));
+CREATE TABLE IF NOT EXISTS pest_alerts(user_id INTEGER NOT NULL, slot INTEGER NOT NULL, planted_ts INTEGER NOT NULL, alerted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,slot,planted_ts));
+CREATE TABLE IF NOT EXISTS potions(user_id INTEGER NOT NULL, day INTEGER NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,day));
+CREATE TABLE IF NOT EXISTS pest_cycles(user_id INTEGER NOT NULL, cycle INTEGER NOT NULL, PRIMARY KEY(user_id,cycle));
+""")
+add_column('plots','potion_used','INTEGER NOT NULL DEFAULT 0')
+add_column('plots','potion_seconds','INTEGER NOT NULL DEFAULT 0')
+add_column('plots','pest_penalty','INTEGER NOT NULL DEFAULT 0')
+add_column('plots','breeze_bonus','INTEGER NOT NULL DEFAULT 0')
 con.commit()
 
 # Separate persistent databases: live tests never touch official player tables.
@@ -107,7 +187,7 @@ if not official_con.execute("SELECT 1 FROM harvest_migrations WHERE name='prelau
         backup_con = sqlite3.connect(legacy_backup)
         official_con.backup(backup_con)
         backup_con.close()
-    for table in ('harvest_alerts','transactions','objective_claims','inventory','plots','players','event'):
+    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
         official_con.execute(f'DELETE FROM {table}')
     official_con.execute("UPDATE harvest_runtime SET mode='official' WHERE id=1")
     official_con.execute("INSERT INTO harvest_migrations(name) VALUES('prelaunch_cleanup_v1')")
@@ -123,6 +203,16 @@ for schema_row in official_con.execute("SELECT type,name,sql FROM sqlite_master 
     if schema_row['name'] in ('harvest_runtime', 'harvest_migrations'):
         continue
     test_con.execute(schema_row['sql'].replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1)) if schema_row['sql'].startswith('CREATE TABLE ') else None
+# Apply additive plot migrations to an existing live-test database as well.
+existing_test_cols={r['name'] for r in test_con.execute('PRAGMA table_info(plots)')}
+for column, definition in (
+    ('potion_used','INTEGER NOT NULL DEFAULT 0'),
+    ('potion_seconds','INTEGER NOT NULL DEFAULT 0'),
+    ('pest_penalty','INTEGER NOT NULL DEFAULT 0'),
+    ('breeze_bonus','INTEGER NOT NULL DEFAULT 0'),
+):
+    if column not in existing_test_cols:
+        test_con.execute(f'ALTER TABLE plots ADD COLUMN {column} {definition}')
 test_con.commit()
 
 def test_mode_active():
@@ -131,7 +221,7 @@ def test_mode_active():
 con = test_con if test_mode_active() else official_con
 
 def clear_test_tables():
-    for table in ('harvest_alerts','transactions','objective_claims','inventory','plots','players','event'):
+    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
         test_con.execute(f'DELETE FROM {table}')
     test_con.commit()
 
@@ -246,6 +336,10 @@ class FarmView(discord.ui.View):
     async def harvest(self,interaction,button):
         await do_harvest(interaction,self.uid)
 
+    @discord.ui.button(label='Water Crops',emoji='💧',style=discord.ButtonStyle.secondary,row=0)
+    async def care(self, interaction, button):
+        await do_crop_care(interaction, self.uid)
+
     @discord.ui.button(label='Sell Produce',emoji='🪙',style=discord.ButtonStyle.primary,row=0)
     async def sell(self,interaction,button):
         await do_sell(interaction,self.uid)
@@ -287,6 +381,18 @@ class FarmView(discord.ui.View):
         except (discord.Forbidden, discord.HTTPException):
             await interaction.response.send_message('Could not send a DM. Check your server DM privacy settings.', ephemeral=True)
 
+    @discord.ui.button(label='Remove Pests',emoji='🐛',style=discord.ButtonStyle.secondary,row=2)
+    async def pests(self,interaction,button):
+        await do_pests(interaction,self.uid)
+
+    @discord.ui.button(label='Growth Potion · 400c',emoji='🧪',style=discord.ButtonStyle.secondary,row=3)
+    async def potion(self,interaction,button):
+        await do_potion(interaction,self.uid)
+
+    @discord.ui.button(label='Harvest Deliveries',emoji='🚚',style=discord.ButtonStyle.secondary,row=3)
+    async def deliveries(self,interaction,button):
+        await show_deliveries(interaction,self.uid)
+
     @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=2)
     async def close(self, interaction, button):
         # Explicitly dismiss only this private farm panel when the player chooses.
@@ -316,12 +422,15 @@ class CropSelect(discord.ui.Select):
                 elif free is None: msg='All plots are occupied. Harvest mature crops first.'
                 elif p['coins']<c['cost']: msg='Not enough coins for that seed.'
                 else:
-                    con.execute('INSERT INTO plots(user_id,slot,crop,planted_window,planted_ts) VALUES(?,?,?,?,?)',(uid,free,crop,current_window(e),int(time.time())))
+                    condition=ensure_cycle(e,cycle_number(e))
+                    breeze=int(condition['weather']=='breeze')
+                    sunshine=int(condition['weather']=='sun')
+                    con.execute('INSERT INTO plots(user_id,slot,crop,planted_window,planted_ts,boost_seconds,breeze_bonus) VALUES(?,?,?,?,?,?,?)',(uid,free,crop,current_window(e),int(time.time()),sunshine,breeze))
                     con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(c['cost'],uid))
                     use_action(uid)
                     con.execute('UPDATE players SET planted=planted+1 WHERE user_id=?',(uid,))
                     log_action(uid,e,'plant',crop,-c['cost'])
-                    msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Ready at {stamp(int(time.time())+c['hours']*3600)}, if the event is still running."
+                    msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Estimated harvest: {stamp(crop_ready_ts(con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,free)).fetchone(),e))}, assuming it is watered on time and pests are treated."
                 con.commit()
         await show_farm(interaction, latest_action='🌱 **Planting:** ' + msg, edit_existing=True)
 
@@ -372,6 +481,29 @@ async def buy_upgrade(interaction,kind):
             con.commit()
     await show_farm(interaction, latest_action='🏡 **Upgrade:** ' + msg, edit_existing=True)
 
+async def do_crop_care(interaction, uid):
+    """Water only thirsty growing crops; restore normal growth time."""
+    async with lock:
+        e = event()
+        if not active(e) or not player(uid):
+            msg = 'The event is not active or you have not joined.'
+        else:
+            now = int(time.time())
+            thirsty = [r for r in con.execute('SELECT * FROM plots WHERE user_id=?', (uid,))
+                       if not r['boost_used'] and crop_thirst_ts(r, e) <= now
+                       and crop_ready_ts(r, e) > now]
+            for r in thirsty:
+                con.execute('UPDATE plots SET boost_used=1, boost_seconds=0 WHERE user_id=? AND slot=?',
+                            (uid, r['slot']))
+            if thirsty:
+                log_action(uid, e, 'crop_care', f'Watered {len(thirsty)} thirsty crops', 0)
+                msg = (f'💧 Watered {len(thirsty)} thirsty crop(s)! They now follow their normal growth schedule. '
+                       'Unwatered crops take 25% longer to mature. No coins or planting actions spent.')
+            else:
+                msg = 'No crops need watering right now. Crops become thirsty halfway through their normal growth time.'
+            con.commit()
+    await show_farm(interaction, latest_action='💧 **Watering:** ' + msg, edit_existing=True)
+
 async def do_harvest(interaction,uid):
     async with lock:
         e=event()
@@ -392,6 +524,10 @@ async def do_harvest(interaction,uid):
                 for r in ready:
                     con.execute('INSERT INTO inventory(user_id,crop,qty) VALUES(?,?,1) ON CONFLICT(user_id,crop) DO UPDATE SET qty=qty+1',(uid,r['crop']))
                     con.execute('DELETE FROM plots WHERE user_id=? AND slot=?',(uid,r['slot']))
+                breeze_reward=sum(int(CROPS[r['crop']]['sale']*0.05) for r in ready if r['breeze_bonus'])
+                if breeze_reward:
+                    con.execute('UPDATE players SET coins=coins+? WHERE user_id=?',(breeze_reward,uid))
+                    log_action(uid,e,'breeze_bonus',f'{len(ready)} harvested crops',breeze_reward)
                 con.execute('UPDATE players SET harvested=harvested+? WHERE user_id=?',(len(ready),uid))
                 log_action(uid,e,'harvest',f'{len(ready)} crops')
                 msg=f'🧺 Harvested {len(ready)} mature crop(s) into your inventory for free. Sell them whenever you like.'
@@ -411,13 +547,79 @@ async def do_sell(interaction,uid):
             items=list(con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,)))
             if not items: msg='🧺 Nothing to sell yet. Wait until crops are ready, click **Harvest Ready**, then click **Sell Produce**.'
             else:
-                earned=inventory_value(uid,p)
+                earned=sum(r['qty']*sale_unit(e,p,r['crop']) for r in items)
                 con.execute('DELETE FROM inventory WHERE user_id=?',(uid,))
                 con.execute('UPDATE players SET coins=coins+?,sold=sold+? WHERE user_id=?',(earned,earned,uid))
                 log_action(uid,e,'sell',f'{sum(x["qty"] for x in items)} crops',earned)
                 msg=f'🪙 Sold {sum(x["qty"] for x in items)} crop(s) for {earned} coins (free).'
             con.commit()
     await show_farm(interaction, latest_action='🪙 **Selling:** ' + msg, edit_existing=True)
+
+async def do_pests(interaction, uid):
+    async with lock:
+        e=event(); rows=[]
+        if active(e) and player(uid):
+            rows=list(con.execute('SELECT * FROM plots WHERE user_id=? AND pest_penalty=1',(uid,)))
+            for r in rows:
+                con.execute('UPDATE plots SET pest_penalty=0 WHERE user_id=? AND slot=?',(uid,r['slot']))
+            if rows:log_action(uid,e,'remove_pests',f'{len(rows)} crops',0)
+            con.commit()
+    await show_farm(interaction,latest_action=f'🐛 Removed pests from {len(rows)} crops for free.',edit_existing=True)
+
+async def do_potion(interaction, uid):
+    async with lock:
+        e=event(); msg='The game is not active.'
+        if active(e) and player(uid):
+            now=int(time.time());day=min(6,(now-e['start_ts'])//86400)
+            p=player(uid)
+            bought=con.execute('SELECT bought FROM potions WHERE user_id=? AND day=?',(uid,day)).fetchone()
+            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,)) if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
+            if bought and bought['bought']>=2:msg='You have already purchased 2 potions today.'
+            elif p['coins']<POTION_PRICE:msg='You need 400 coins for a Growth Potion.'
+            elif not rows:msg='No eligible crops: potions require at least 1 hour remaining and can only be used once per crop.'
+            else:
+                for r in rows:
+                    reduction=int((crop_ready_ts(r,e)-now)*0.20)
+                    con.execute('UPDATE plots SET potion_used=1,potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',(reduction,uid,r['slot']))
+                con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(POTION_PRICE,uid))
+                con.execute('INSERT INTO potions(user_id,day,bought) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET bought=bought+1',(uid,day))
+                log_action(uid,e,'growth_potion',f'{len(rows)} crops',-POTION_PRICE)
+                msg=f'🧪 Growth Potion used on {len(rows)} crops: 20% off their remaining time. Cost 400c.'
+            con.commit()
+    await show_farm(interaction,latest_action=msg,edit_existing=True)
+
+async def show_deliveries(interaction, uid):
+    async with lock:
+        e=event(); orders=active_orders(e) if e else []
+        lines=[]
+        for o in orders:
+            claimed=con.execute('SELECT 1 FROM delivery_claims WHERE user_id=? AND cycle=?',(uid,o['cycle'])).fetchone()
+            lines.append(f'**Order #{o["cycle"]+1} ({o["kind"]})** — {o["qty"]} × {CROPS[o["crop"]]["name"]} · **{o["reward"]}c** · ends {stamp(o["ends"])}'+(' · ✅ Delivered' if claimed else ''))
+        msg='\n'.join(lines) or 'No active deliveries right now.'
+    await interaction.response.send_message(embed=make_embed('🚚 Harvest Deliveries',msg),view=DeliveryView(uid),ephemeral=True)
+
+class DeliveryView(discord.ui.View):
+    def __init__(self,uid):
+        super().__init__(timeout=180);self.uid=uid
+    @discord.ui.button(label='Deliver Available Orders',emoji='🚚',style=discord.ButtonStyle.success)
+    async def deliver(self,interaction,button):
+        if interaction.user.id!=self.uid:
+            await interaction.response.send_message('This is not your delivery menu.',ephemeral=True);return
+        async with lock:
+            e=event(); total=0;done=[]
+            if active(e):
+                for o in active_orders(e):
+                    if con.execute('SELECT 1 FROM delivery_claims WHERE user_id=? AND cycle=?',(self.uid,o['cycle'])).fetchone():continue
+                    stock=con.execute('SELECT qty FROM inventory WHERE user_id=? AND crop=?',(self.uid,o['crop'])).fetchone()
+                    if stock and stock['qty']>=o['qty']:
+                        con.execute('UPDATE inventory SET qty=qty-? WHERE user_id=? AND crop=?',(o['qty'],self.uid,o['crop']))
+                        con.execute('INSERT INTO delivery_claims(user_id,cycle) VALUES(?,?)',(self.uid,o['cycle']))
+                        total+=o['reward'];done.append(str(o['cycle']+1))
+                if total:
+                    con.execute('UPDATE players SET coins=coins+?,sold=sold+? WHERE user_id=?',(total,total,self.uid))
+                    log_action(self.uid,e,'delivery',','.join(done),total)
+                con.commit()
+        await interaction.response.send_message(f'🚚 Delivered {len(done)} order(s), earned {total:,} coins.' if done else 'No active orders can be completed with your current inventory.',ephemeral=True)
 
 async def show_farm(interaction, latest_action=None, edit_existing=False):
     uid=interaction.user.id
@@ -431,6 +633,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
             await interaction.response.send_message('Use the Join Harvest Hustle button in the host announcement first.',ephemeral=True)
             return
         if active(e):
+            ensure_cycle(e,cycle_number(e))
             sync_actions(uid,e)
             con.commit()
         p=player(uid)
@@ -447,9 +650,15 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
                 c=CROPS[r['crop']]
                 ready_ts=crop_ready_ts(r,e)
                 remaining=max(0,ready_ts-int(time.time()))
-                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready below**' if remaining==0 else f'⏳ Ready <t:{ready_ts}:R> · <t:{ready_ts}:t>'))
+                care = (' 🐛 PESTS — Remove Pests!' if r['pest_penalty'] else '') + (' 💧 Watered' if r['boost_used'] else (' 💧 **THIRSTY — Water Crops!**' if crop_thirst_ts(r,e)<=int(time.time()) and remaining>0 else ' 🌱 Growing'))
+                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready below**' if remaining==0 else f'⏳ Ready <t:{ready_ts}:R> · <t:{ready_ts}:t>' + care))
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
         embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 7**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
+        condition=current_conditions(e)
+        if condition:
+            embed.add_field(name='🌦️ Current Weather / 📈 Market',value=f'{condition["weather"].title()} · {CROPS[condition["market_crop"]]["name"]} {condition["market_pct"]:+.0%} · updates every 6h',inline=False)
+        pest_count=sum(1 for r in plots.values() if r['pest_penalty'])
+        if pest_count:embed.add_field(name='🐛 Pest Alert',value=f'{pest_count} affected crops — click Remove Pests',inline=False)
         embed.add_field(name='💰 Coins',value=str(p['coins']))
         embed.add_field(name='🌱 Planting actions left',value=f'{max(0,planting_action_limit(p)-p["actions_used"])}/{planting_action_limit(p)}')
         embed.add_field(name='🏆 Farm value',value=f'{farm_value(uid,p,e):,}')
@@ -462,6 +671,8 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
         embed.add_field(name='📊 Your Season So Far',value=f'🌱 Planted **{p["planted"]}**  •  🧺 Harvested **{p["harvested"]}**\n🪙 Sales Revenue **{p["sold"]:,}c**',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
+        deliveries=[f'{qty} × {CROPS[crop]["name"]} → {reward}c (ends hour {end})' for cycle,(crop,qty,reward,end) in self.test_deliveries.items() if cycle not in self.delivered and cycle*6<=self.test_hour<end]
+        if deliveries:embed.add_field(name='🚚 Active Test Deliveries',value='\n'.join(deliveries[-3:]),inline=False)
         if latest_action:
             embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
         embed.set_footer(text='When a crop is ready, click Harvest Ready, then Sell Produce. Only planting uses actions.')
@@ -859,7 +1070,7 @@ async def rules(interaction:discord.Interaction):
     crops='\n'.join(f"{v['name']}: seed {v['cost']}c → sells {v['sale']}c · grows {v['hours']} hours" for v in CROPS.values())
     e=make_embed('📖 Harvest Hustle Rules',
         '**Join using the host-posted Join button; late joining is allowed while the event is active.** Seven days, fourteen 12-hour sessions. You get **one planting action per owned plot per session (10–20)**; unused actions do not roll over. Each player starts with **2,000 coins and 10 plots**.\n\n'
-        '**Plant**: one planting action and the seed cost per plot. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
+        '**Plant**: one planting action and the seed cost per plot. **Water Crops**: crops become thirsty halfway through growth and trigger a DM. Water thirsty crops for free to restore normal growth time; otherwise they take 25% longer. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
         '**Winner**: coins + stored produce sale value + upgrade resale value. **Growing crops are worth 0 at closing.** Tie order: lifetime sales, total crops harvested, earlier join, then Discord user ID.\n\n'
@@ -875,7 +1086,7 @@ async def harvest_help(interaction: discord.Interaction):
         '**Getting started**\n'
         '1. Click the **Join Harvest Hustle** button in the host announcement.\n'
         '2. Once farming begins, use `/harvest farm` to open your private controls.\n'
-        '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**.\n'
+        '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**. Crops become thirsty halfway through growth; the bot sends a DM. Use **Water Crops** to water affected crops for free. Unwatered crops take 25% longer to mature.\n'
         '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
         '5. Click **Sell Produce** to sell everything in your inventory for coins. Harvesting and selling are **free actions**.\n\n'
         '**Starting resources:** 2,000 in-game coins, 10 plots and **10 planting actions per 12-hour session**, increasing by one action for each extra plot purchased (up to 20). Unused actions do not carry over. Crops grow in real time, independent of action resets.\n\n'
@@ -930,7 +1141,7 @@ async def reset(interaction:discord.Interaction,confirm:str):
         e=event()
         if e and not e['ended']: msg='Cannot reset a scheduled or active event.'
         else:
-            for table in ('harvest_alerts','transactions','objective_claims','inventory','plots','players','event'):
+            for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
                 con.execute(f'DELETE FROM {table}')
             con.commit()
             msg='Completed event data cleared. You can start a new event.'
@@ -1205,6 +1416,91 @@ async def harvest_alert_watcher():
                 con.execute('INSERT OR IGNORE INTO harvest_alerts(user_id,ready_ts) VALUES(?,?)',(uid,ready_ts))
                 con.commit()
 
+@tasks.loop(minutes=1)
+async def economy_watcher():
+    async with lock:
+        e=event()
+        if not active(e) or e['live_test']:return
+        now=int(time.time());n=cycle_number(e)
+        row=ensure_cycle(e,n)
+        ensure_delivery(e,n)
+        ensure_delivery(e,n+1)  # six-hour advance forecast
+        apply_automatic_irrigation(e,now)
+        # Pests: rare per-player six-hour exposure, no crop death, no repeat on same planting.
+        for p in con.execute('SELECT user_id FROM players'):
+            uid=p['user_id']
+            rng=random.Random(f'{e["start_ts"]}:pest:{n}:{uid}')
+            if con.execute('SELECT 1 FROM pest_cycles WHERE user_id=? AND cycle=?',(uid,n)).fetchone():continue
+            con.execute('INSERT INTO pest_cycles(user_id,cycle) VALUES(?,?)',(uid,n))
+            if rng.random()>=0.10:continue
+            eligible=[r for r in con.execute('SELECT * FROM plots WHERE user_id=?',(uid,)) if not r['pest_penalty'] and crop_ready_ts(r,e)>now and not con.execute('SELECT 1 FROM pest_alerts WHERE user_id=? AND slot=? AND planted_ts=?',(uid,r['slot'],r['planted_ts'])).fetchone()]
+            for r in eligible[:3]:
+                con.execute('UPDATE plots SET pest_penalty=1 WHERE user_id=? AND slot=?',(uid,r['slot']))
+                con.execute('INSERT OR IGNORE INTO pest_alerts(user_id,slot,planted_ts) VALUES(?,?,?)',(uid,r['slot'],r['planted_ts']))
+        announced=bool(row['announced'])
+        if not announced:con.execute('UPDATE farm_cycles SET announced=1 WHERE cycle=?',(n,))
+        alerts=list(con.execute('SELECT user_id,COUNT(*) AS qty FROM pest_alerts WHERE alerted=0 GROUP BY user_id'))
+        con.execute('UPDATE pest_alerts SET alerted=1 WHERE alerted=0')
+        forecast=con.execute('SELECT * FROM delivery_orders WHERE cycle=?',(n+1,)).fetchone()
+        con.commit()
+    if not announced:
+        pct=f'{row["market_pct"]:+.0%}'
+        msg=(f'🌦️ **HARVEST WEATHER — {row["weather"].upper()}** (6 hours)\n'
+             f'📈 **MARKET:** {CROPS[row["market_crop"]]["name"]} {pct} sale price.\n'
+             '☀️ Sunshine: new crops grow 10% faster. 🌧️ Rain/Irrigation: thirsty crops watered automatically. 🍃 Breeze: new crops get +5% harvest bonus.\n'
+             f'🚚 **NEXT DELIVERY IN 6 HOURS:** {forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} ({forecast["kind"]}).\n'
+             'Open **/harvest farm** → **Harvest Deliveries** for currently active orders.')
+        await send_announcement_checked(msg)
+    for r in alerts:
+        try:
+            user=bot.get_user(r['user_id']) or await bot.fetch_user(r['user_id'])
+            await user.send(f'🐛 **Harvest Hustle — Pest Alert!** {r["qty"]} crop(s) are affected. Open `/harvest farm` and click **Remove Pests**. Untreated crops grow 15% slower. Treatment is free.')
+        except (discord.Forbidden,discord.HTTPException):
+            logging.info('Pest DM blocked for %s',r['user_id'])
+
+@economy_watcher.before_loop
+async def before_economy():
+    await bot.wait_until_ready()
+
+@tasks.loop(minutes=1)
+async def watering_alert_watcher():
+    async with lock:
+        e = event()
+        if not active(e):
+            return
+        now = int(time.time())
+        ensure_cycle(e,cycle_number(e))
+        apply_automatic_irrigation(e,now)
+        con.commit()
+        due = {}
+        for r in con.execute('SELECT * FROM plots'):
+            planted = int(r['planted_ts'] or e['start_ts'] + r['planted_window'] * WINDOW)
+            if (not r['boost_used'] and crop_thirst_ts(r, e) <= now < crop_ready_ts(r, e)
+                and not con.execute('SELECT 1 FROM watering_alerts WHERE user_id=? AND slot=? AND planted_ts=?',
+                                    (r['user_id'], r['slot'], planted)).fetchone()):
+                due.setdefault(r['user_id'], []).append((r['slot'], planted, r['crop']))
+    for uid, crops in due.items():
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            names = ', '.join(f"plot {slot}: {CROPS[crop]['name']}" for slot, _, crop in crops)
+            await user.send('💧 **Harvest Hustle — Your crops need watering!**\n'
+                            f'{len(crops)} crop(s) are thirsty ({names}).\n'
+                            'Open **`/harvest farm`** and click **💧 Water Crops** to water all affected crops. '
+                            'Without watering, these crops take **25% longer** to mature. '
+                            'Watering is free and uses no planting actions.')
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logging.info('Could not DM watering alert to %s: %s', uid, exc)
+        finally:
+            async with lock:
+                for slot, planted, _ in crops:
+                    con.execute('INSERT OR IGNORE INTO watering_alerts(user_id,slot,planted_ts) VALUES(?,?,?)',
+                                (uid, slot, planted))
+                con.commit()
+
+@watering_alert_watcher.before_loop
+async def before_watering_alerts():
+    await bot.wait_until_ready()
+
 @harvest_alert_watcher.before_loop
 async def before_harvest_alerts():
     await bot.wait_until_ready()
@@ -1239,6 +1535,38 @@ class HarvestTestView(discord.ui.View):
         self.daily_claimed = {}  # day -> claimed mission keys
         self.missions_completed = 0
         self.action_log = []
+        self.cared_plots = set()
+        self.pest_plots = set()
+        self.potion_plots = set()
+        self.potion_savings = {}
+        self.potions_by_day = {}
+        self.test_weather = 'clear'
+        self.test_market_crop = 'carrot'
+        self.test_market_pct = 0.0
+        self.test_deliveries = {}
+        self.delivered = set()
+        self.last_cycle = -1
+        self.advance_economy(0)
+
+
+    def advance_economy(self, cycle):
+        rng=random.Random(f'test:{self.host_id}:{cycle}')
+        self.test_weather=rng.choice(WEATHER)
+        self.test_market_crop=rng.choice(list(CROPS))
+        self.test_market_pct=rng.choice(MARKET_MODIFIERS)
+        kind=('quick','standard','premium')[cycle%3]
+        crop=rng.choice({'quick':('carrot','corn'),'standard':('apple','pumpkin'),'premium':('gourd','pumpkin')}[kind])
+        qty={'quick':4,'standard':3,'premium':2}[kind]
+        self.test_deliveries[cycle]=(crop,qty,int(round(qty*CROPS[crop]['sale']*1.18)),cycle*6+{'quick':12,'standard':18,'premium':24}[kind])
+        self.last_cycle=cycle
+        if self.test_weather in ('rain','irrigation'):
+            self.cared_plots.update(slot for slot,(crop,planted) in self.plots.items() if self.test_hour-planted>=CROPS[crop]['hours']*.5)
+        if rng.random()<.10:
+            eligible=[slot for slot in self.plots if slot not in self.pest_plots and self.test_hour-self.plots[slot][1]<self.test_crop_hours(slot,self.plots[slot][0])]
+            self.pest_plots.update(eligible[:3])
+
+    def test_crop_remaining(self, slot, crop, planted):
+        return max(0, self.test_crop_hours(slot,crop)-(self.test_hour-planted)-self.potion_savings.get(slot,0))
 
     def record_action(self, action, quantity=1):
         day = min(6, self.test_hour // 24)
@@ -1267,6 +1595,9 @@ class HarvestTestView(discord.ui.View):
                 + plot_resale_value(self.extra_plot)
                 + self.market * UPGRADES['market']['resale'])
 
+    def test_crop_hours(self, slot, crop):
+        return CROPS[crop]['hours'] * (1.0 if slot in self.cared_plots else 1.25) * (1.15 if slot in self.pest_plots else 1.0)
+
     def summary(self, latest_action=None):
         lines = []
         for slot in range(1, PLOTS + self.extra_plot + 1):
@@ -1274,8 +1605,8 @@ class HarvestTestView(discord.ui.View):
                 lines.append(f'{slot}. Empty')
             else:
                 crop, planted_session = self.plots[slot]
-                left = max(0, CROPS[crop]['hours'] - (self.test_hour - planted_session))
-                lines.append(f'{slot}. {CROPS[crop]["name"]} — ' + ('✅ Ready! Click Harvest Ready' if not left else f'⏳ {left} simulated hours remaining'))
+                left = self.test_crop_remaining(slot,crop,planted_session)
+                lines.append(f'{slot}. {CROPS[crop]["name"]} — ' + ('✅ Ready! Click Harvest Ready' if not left else f'⏳ {left:.1f} simulated hours remaining' + (' 💧 Watered' if slot in self.cared_plots else (' 💧 THIRSTY!' if self.test_hour - planted_session >= CROPS[crop]['hours'] * 0.5 else ' 🌱 Growing'))))
         inv = ', '.join(f'{CROPS[k]["name"]} x{qty}' for k, qty in self.inventory.items() if qty) or 'Empty'
         embed = make_embed('🧪 Harvest Hustle — PRIVATE TEST SANDBOX',
                            f'**Day {self.test_hour // 24 + 1} · Session {self.test_hour // 12 % 2 + 1}** (of 14) · Hour {self.test_hour}/168\n'
@@ -1283,8 +1614,11 @@ class HarvestTestView(discord.ui.View):
                            f'**Planting actions:** {self.actions}/{PLOTS + self.extra_plot} used\n'
                            f'**Plots:** {PLOTS + self.extra_plot}/20 · **Market stalls:** {self.market}\n'
                            f'**Planted:** {self.planted} · **Harvested:** {self.harvested} · **Sales Revenue:** {self.sold:,}c\n'
-                           f'**Missions completed:** {self.missions_completed}\n\n'
+                           f'**Missions completed:** {self.missions_completed}\n'
+                           f'**Weather:** {self.test_weather.title()} · **Market:** {CROPS[self.test_market_crop]["name"]} {self.test_market_pct:+.0%} · **Pests:** {len(self.pest_plots)}\n\n'
                            '**Plots**\n' + '\n'.join(lines) + '\n\n**Inventory:** ' + inv + '\n\n**Today’s missions**\n' + self.mission_status() + '\n\n⏩ **Advance 2 Hours** grows crops; planting actions refresh every 12 hours. Once ready, click **Harvest Ready**, then **Sell Produce**.')
+        deliveries=[f'{qty} × {CROPS[crop]["name"]} → {reward}c (ends hour {end})' for cycle,(crop,qty,reward,end) in self.test_deliveries.items() if cycle not in self.delivered and cycle*6<=self.test_hour<end]
+        if deliveries:embed.add_field(name='🚚 Active Test Deliveries',value='\n'.join(deliveries[-3:]),inline=False)
         if latest_action:
             embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
         embed.set_footer(text='TEST ONLY · No real coins, event records, announcements or leaderboard changes')
@@ -1311,6 +1645,10 @@ class HarvestTestView(discord.ui.View):
         elif self.coins < cfg['cost']:
             msg = 'Not enough test coins.'
         else:
+            self.cared_plots.discard(free)
+            self.pest_plots.discard(free)
+            self.potion_plots.discard(free)
+            self.potion_savings.pop(free,None)
             self.plots[free] = (crop, self.test_hour)
             self.coins -= cfg['cost']
             self.actions += 1
@@ -1319,20 +1657,37 @@ class HarvestTestView(discord.ui.View):
             msg = f'Planted {cfg["name"]} in plot {free}.'
         await self.refresh(interaction, msg)
 
+    @discord.ui.button(label='Water Crops', emoji='💧', style=discord.ButtonStyle.secondary, row=1)
+    async def care_test(self, interaction, button):
+        growing = [(slot, crop) for slot, (crop, planted) in self.plots.items()
+                   if slot not in self.cared_plots and CROPS[crop]['hours'] * 0.5 <= self.test_hour - planted < CROPS[crop]['hours'] * 1.25]
+        if self.test_hour >= 168:
+            msg = 'Test has ended. Reset to start again.'
+        elif not growing:
+            msg = 'No thirsty growing crops. Advance simulated time until crops reach halfway through growth.'
+        else:
+            self.cared_plots.update(slot for slot, crop in growing)
+            msg = f'💧 Watered {len(growing)} thirsty crops. Normal growth schedule restored; otherwise growth takes 25% longer. No actions or coins spent.'
+        await self.refresh(interaction, msg)
+
     @discord.ui.button(label='Harvest Ready', emoji='🧺', style=discord.ButtonStyle.success, row=1)
     async def harvest_test(self, interaction, button):
         ready = [(slot, crop) for slot, (crop, planted) in self.plots.items()
-                 if self.test_hour - planted >= CROPS[crop]['hours']]
+                 if self.test_crop_remaining(slot,crop,planted)<=0]
         for slot, crop in ready:
             self.inventory[crop] += 1
             del self.plots[slot]
+            self.cared_plots.discard(slot)
+            self.pest_plots.discard(slot)
+            self.potion_plots.discard(slot)
+            self.potion_savings.pop(slot,None)
         self.harvested += len(ready)
         if ready: self.record_action('harvest', len(ready))
         await self.refresh(interaction, f'Harvested {len(ready)} ready crop(s).')
 
     @discord.ui.button(label='Sell Produce', emoji='🪙', style=discord.ButtonStyle.primary, row=1)
     async def sell_test(self, interaction, button):
-        earned = sum(int(qty * CROPS[k]['sale'] * (1 + self.market * 0.06))
+        earned = sum(int(qty * CROPS[k]['sale'] * (1 + self.market * 0.06) * (1+self.test_market_pct if k==self.test_market_crop else 1))
                      for k, qty in self.inventory.items())
         self.coins += earned
         self.sold += earned
@@ -1346,12 +1701,32 @@ class HarvestTestView(discord.ui.View):
             previous=self.test_hour
             self.test_hour=min(168,self.test_hour+2)
             self.session=self.test_hour//12
+            if self.test_hour//6 != previous//6:
+                before_pests=set(self.pest_plots)
+                self.advance_economy(self.test_hour//6)
+                if self.pest_plots-before_pests:
+                    try:
+                        await interaction.user.send(f'🧪🐛 **Harvest Hustle TEST — Pest Alert!** {len(self.pest_plots-before_pests)} crops need treatment. Open `/harvest test` and click **Remove Pests (Test)**. Untreated crops grow 15% slower.')
+                    except (discord.Forbidden,discord.HTTPException):pass
             if self.test_hour//12>previous//12 and self.test_hour<168:
                 self.actions=0
+            newly_thirsty=[(slot,crop) for slot,(crop,planted) in self.plots.items()
+                          if slot not in self.cared_plots and previous < planted + CROPS[crop]['hours'] * 0.5 <= self.test_hour]
             newly_ready=[crop for slot,(crop,planted) in self.plots.items()
-                         if previous < planted + CROPS[crop]['hours'] <= self.test_hour]
-            ready_count=sum(1 for crop, planted in self.plots.values() if self.test_hour-planted>=CROPS[crop]['hours'])
+                         if previous < planted + self.test_crop_hours(slot, crop) - self.potion_savings.get(slot,0) <= self.test_hour]
+            ready_count=sum(1 for slot,(crop, planted) in self.plots.items() if self.test_crop_remaining(slot,crop,planted)<=0)
+            if newly_thirsty:
+                try:
+                    names=', '.join(f'plot {slot}: {CROPS[crop]["name"]}' for slot,crop in newly_thirsty)
+                    await interaction.user.send(
+                        f'🧪💧 **Harvest Hustle TEST — Your crops need watering!**\n'
+                        f'{len(newly_thirsty)} crop(s) are thirsty ({names}).\n'
+                        'Return to your private `/harvest test` dashboard and click **💧 Water Crops**. '
+                        'Unwatered crops take 25% longer to mature.')
+                except (discord.Forbidden, discord.HTTPException):
+                    logging.info('Test watering DM blocked for user %s', self.host_id)
             msg=(f'Advanced to hour {self.test_hour}/168. '
+                 + (f'💧 **SIMULATED WATERING DM:** {len(newly_thirsty)} crop(s) need water! Click **Water Crops**. ' if newly_thirsty else '')
                  + (f'🔔 **SIMULATED HARVEST ALERT:** {len(newly_ready)} crop(s) just matured! '
                     f'In the live game this triggers a DM. Click **Harvest Ready**, then **Sell Produce**. '
                     if newly_ready else
@@ -1414,10 +1789,11 @@ class HarvestTestView(discord.ui.View):
             return
         previous = self.test_hour
         self.test_hour = min(168, ((self.test_hour // 12) + 1) * 12)
+        self.advance_economy(self.test_hour//6)
         self.session = self.test_hour // 12
         if self.test_hour < 168:
             self.actions = 0
-        ready = sum(1 for crop, planted in self.plots.values() if self.test_hour - planted >= CROPS[crop]['hours'])
+        ready = sum(1 for slot,(crop,planted) in self.plots.items() if self.test_crop_remaining(slot,crop,planted)<=0)
         await self.refresh(interaction, f'Advanced from hour {previous} to {self.test_hour}. ' + (f'{ready} crops ready to harvest. ' if ready else '') + ('New planting session: actions refreshed.' if self.test_hour < 168 else f'🏆 TEST FINISHED — final farm value {self.value():,}c. Unharvested crops excluded.'))
 
     @discord.ui.button(label='Final Score / Stats', emoji='🏆', style=discord.ButtonStyle.secondary, row=4)
@@ -1462,6 +1838,41 @@ class HarvestTestView(discord.ui.View):
         await interaction.response.edit_message(view=None)
         self.stop()
 
+    @discord.ui.button(label='Remove Pests (Test)',emoji='🐛',style=discord.ButtonStyle.secondary,row=2)
+    async def pests_test(self,interaction,button):
+        count=len(self.pest_plots)
+        self.pest_plots.clear()
+        await self.refresh(interaction,f'Removed pests from {count} test crops for free.')
+
+    @discord.ui.button(label='Growth Potion (Test)',emoji='🧪',style=discord.ButtonStyle.secondary,row=3)
+    async def potion_test(self,interaction,button):
+        day=min(6,self.test_hour//24)
+        eligible=[(slot,crop,planted) for slot,(crop,planted) in self.plots.items() if slot not in self.potion_plots and self.test_crop_remaining(slot,crop,planted)>=1][:5]
+        if self.potions_by_day.get(day,0)>=2:msg='Already used 2 potions this test day.'
+        elif self.coins<400:msg='Not enough coins (400c required).'
+        elif not eligible:msg='No eligible crops with at least 1 hour remaining.'
+        else:
+            for slot,crop,planted in eligible:
+                self.potion_savings[slot]=self.potion_savings.get(slot,0)+self.test_crop_remaining(slot,crop,planted)*.20
+                self.potion_plots.add(slot)
+            self.coins-=400
+            self.potions_by_day[day]=self.potions_by_day.get(day,0)+1
+            msg=f'Used Growth Potion on {len(eligible)} crops for 400c; 20% time reduction.'
+        await self.refresh(interaction,msg)
+
+    @discord.ui.button(label='Deliver Crops (Test)',emoji='🚚',style=discord.ButtonStyle.secondary,row=4)
+    async def deliveries_test(self,interaction,button):
+        total=0;completed=[]
+        for cycle,(crop,qty,reward,end) in self.test_deliveries.items():
+            if cycle in self.delivered or not cycle*6<=self.test_hour<end:continue
+            if self.inventory[crop]>=qty:
+                self.inventory[crop]-=qty
+                self.delivered.add(cycle)
+                total+=reward
+                completed.append(cycle)
+        self.coins+=total;self.sold+=total
+        await self.refresh(interaction,f'Delivered {len(completed)} orders for {total:,} coins.' if completed else 'No delivery can be fulfilled. Save harvested inventory for the active orders.')
+
     @discord.ui.button(label='Reset Test', emoji='🔄', style=discord.ButtonStyle.danger, row=2)
     async def reset_test(self, interaction, button):
         self.__init__(self.host_id)
@@ -1474,7 +1885,7 @@ async def harvest_test(interaction: discord.Interaction):
         await interaction.response.send_message('Host only.', ephemeral=True)
         return
     view = HarvestTestView(interaction.user.id)
-    await interaction.response.send_message('Play through all seven simulated days using **Advance 2 Hours** or **Advance 12 Hours**. Plant, harvest, sell, upgrade, claim daily missions, check final scoring and test DMs. This private sandbox does not change the official event or leaderboard.',
+    await interaction.response.send_message('Play through all seven simulated days using **Advance 2 Hours** or **Advance 12 Hours**. Plant, wait for simulated watering alerts, water thirsty crops, harvest, sell, upgrade, claim daily missions, check final scoring and test DMs. This private sandbox does not change the official event or leaderboard.',
                                             embed=view.summary(), view=view, ephemeral=True)
 
 bot.tree.add_command(harvest)
@@ -1518,6 +1929,10 @@ async def main():
             event_watcher.start()
         if not harvest_alert_watcher.is_running():
             harvest_alert_watcher.start()
+        if not watering_alert_watcher.is_running():
+            watering_alert_watcher.start()
+        if not economy_watcher.is_running():
+            economy_watcher.start()
 
         await bot.connect(reconnect=True)
 
