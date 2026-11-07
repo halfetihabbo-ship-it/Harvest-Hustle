@@ -1080,7 +1080,7 @@ async def leaderboard(interaction:discord.Interaction):
         if mine and mine>15: desc+=f'\n\n**Your rank:** #{mine} — {ranks[mine-1][0]:,} farm value'
         embed=make_embed('🏆 Autumn Harvest Leaderboard',desc, AUTUMN['gold'])
         embed.set_footer(text='Ties: farm value → total sales → harvest count → earlier registration → Discord ID.')
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @harvest.command(name='rules',description='Learn the game rules')
 async def rules(interaction:discord.Interaction):
