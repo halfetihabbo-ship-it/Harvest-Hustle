@@ -18,8 +18,6 @@ HOST_IDS = {int(x.strip()) for x in os.environ.get('HOST_IDS', '1501587787294703
 CHANNEL_ID = int(os.environ.get('EVENT_CHANNEL_ID', '1567980502965551144'))
 ROLE_PANEL_CHANNEL_ID = int(os.environ.get('ROLE_PANEL_CHANNEL_ID', str(CHANNEL_ID)))
 ROLE_ID = int(os.environ.get('EVENT_ROLE_ID', '1567982021106602065'))
-ANNOUNCEMENT_CHANNEL_ID = int(os.environ.get('ANNOUNCEMENT_CHANNEL_ID', '1568316136104140810'))
-ANNOUNCEMENT_ROLE_ID = int(os.environ.get('ANNOUNCEMENT_ROLE_ID', '1567982021106602065'))
 DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
 WINDOW = 12 * 3600
 DURATION = 14 * WINDOW
@@ -40,6 +38,13 @@ import math
 WEATHER = ('sun', 'rain', 'breeze', 'clear', 'irrigation')
 MARKET_MODIFIERS = (-0.10, -0.10, -0.10, -0.05, 0.0, 0.10, 0.10, 0.15)  # zero-average market; -10% to +15%
 POTION_PRICE = 400
+ANIMAL_LIMIT = 10
+ANIMALS = {
+    'chicken': {'name': '🐔 Chicken', 'produce': '🥚 Eggs', 'cost': 900, 'sale': 90, 'hours': 4},
+    'pig': {'name': '🐷 Pig', 'produce': '🍄 Truffles', 'cost': 1600, 'sale': 240, 'hours': 8},
+    'cow': {'name': '🐄 Cow', 'produce': '🥛 Milk', 'cost': 2400, 'sale': 420, 'hours': 12},
+}
+
 
 def cycle_number(e, now=None):
     return max(0, (int(time.time() if now is None else now)-e['start_ts']) // 21600)
@@ -169,6 +174,21 @@ CREATE TABLE IF NOT EXISTS pest_alerts(user_id INTEGER NOT NULL, slot INTEGER NO
 CREATE TABLE IF NOT EXISTS potions(user_id INTEGER NOT NULL, day INTEGER NOT NULL, bought INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,day));
 CREATE TABLE IF NOT EXISTS pest_cycles(user_id INTEGER NOT NULL, cycle INTEGER NOT NULL, PRIMARY KEY(user_id,cycle));
 """)
+con.executescript("""
+CREATE TABLE IF NOT EXISTS livestock (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    species TEXT NOT NULL,
+    last_collection_ts INTEGER NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS animal_inventory (
+    user_id INTEGER NOT NULL,
+    species TEXT NOT NULL,
+    qty INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(user_id,species)
+);
+""")
 add_column('plots','potion_used','INTEGER NOT NULL DEFAULT 0')
 add_column('plots','potion_seconds','INTEGER NOT NULL DEFAULT 0')
 add_column('plots','pest_penalty','INTEGER NOT NULL DEFAULT 0')
@@ -189,7 +209,7 @@ if not official_con.execute("SELECT 1 FROM harvest_migrations WHERE name='prelau
         backup_con = sqlite3.connect(legacy_backup)
         official_con.backup(backup_con)
         backup_con.close()
-    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
+    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles','livestock','animal_inventory'):
         official_con.execute(f'DELETE FROM {table}')
     official_con.execute("UPDATE harvest_runtime SET mode='official' WHERE id=1")
     official_con.execute("INSERT INTO harvest_migrations(name) VALUES('prelaunch_cleanup_v1')")
@@ -210,7 +230,7 @@ for schema_row in official_con.execute("SELECT type,name,sql FROM sqlite_master 
 for table in ('event', 'players', 'plots', 'inventory', 'transactions',
               'objective_claims', 'watering_alerts', 'harvest_alerts',
               'farm_cycles', 'delivery_orders', 'delivery_claims',
-              'pest_alerts', 'potions', 'pest_cycles'):
+              'pest_alerts', 'potions', 'pest_cycles', 'livestock', 'animal_inventory'):
     official_columns = official_con.execute(f'PRAGMA table_info({table})').fetchall()
     test_columns = {r['name'] for r in test_con.execute(f'PRAGMA table_info({table})')}
     for col in official_columns:
@@ -234,7 +254,7 @@ def test_mode_active():
 con = test_con if test_mode_active() else official_con
 
 def clear_test_tables():
-    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
+    for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles','livestock','animal_inventory'):
         test_con.execute(f'DELETE FROM {table}')
     test_con.commit()
 
@@ -278,9 +298,22 @@ def inventory_value(uid, p):
     multiplier = 1 + p['market'] * 0.06
     return sum(int(q['qty'] * CROPS[q['crop']]['sale'] * multiplier) for q in con.execute('SELECT * FROM inventory WHERE user_id=?',(uid,)))
 
+def livestock_batches(animal, now=None):
+    now = int(time.time() if now is None else now)
+    period = ANIMALS[animal['species']]['hours'] * 3600
+    return min(2, max(0, (now - animal['last_collection_ts']) // period))
+
+def livestock_resale(uid):
+    return sum(ANIMALS[r['species']]['cost'] // 2 for r in con.execute(
+        'SELECT species FROM livestock WHERE user_id=?', (uid,)))
+
+def livestock_inventory_value(uid):
+    return sum(r['qty'] * ANIMALS[r['species']]['sale'] for r in con.execute(
+        'SELECT species,qty FROM animal_inventory WHERE user_id=?', (uid,)))
+
 def farm_value(uid, p, e):
     # Unharvested crops have no end-of-event value; the rule is visible throughout.
-    return p['coins'] + inventory_value(uid,p) + plot_resale_value(p['extra_plot']) + p['market'] * UPGRADES['market']['resale']
+    return p['coins'] + inventory_value(uid,p) + plot_resale_value(p['extra_plot']) + p['market'] * UPGRADES['market']['resale'] + livestock_resale(uid) + livestock_inventory_value(uid)
 
 def board(e):
     rows=[]
@@ -369,11 +402,36 @@ class FarmView(discord.ui.View):
     async def refresh(self,interaction,button):
         await show_farm(interaction)
 
+    @discord.ui.button(label='Save to DMs', emoji='📩', style=discord.ButtonStyle.secondary, row=3)
+    async def save_farm(self, interaction, button):
+        # The game channel remains ephemeral; this is an optional lasting copy.
+        async with lock:
+            e=event()
+            p=player(self.uid)
+            if not e or not p:
+                await interaction.response.send_message('Join the game first.', ephemeral=True)
+                return
+            coins=p['coins']
+            value=farm_value(self.uid,p,e)
+            inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in
+                          con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(self.uid,))) or 'Empty'
+            ready=sum(1 for r in con.execute('SELECT * FROM plots WHERE user_id=?',(self.uid,))
+                      if crop_ready_ts(r,e)<=int(time.time()))
+            msg=make_embed('🍁 Your Harvest Hustle Farm — Saved Copy',
+                f'**Coins:** {coins:,}c\n**Farm value:** {value:,}c\n'
+                f'**Plots:** {available_plots(p)}/20\n**Crops ready:** {ready}\n'
+                f'**Inventory:** {inv}\n\nOpen `/harvest farm` in the game channel to play.')
+        try:
+            await interaction.user.send(embed=msg)
+            await interaction.response.send_message('📩 A lasting copy of your farm summary was sent to your DMs.', ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message('Could not send a DM. Check your server DM privacy settings.', ephemeral=True)
+
     @discord.ui.button(label='Remove Pests',emoji='🐛',style=discord.ButtonStyle.secondary,row=1)
     async def pests(self,interaction,button):
         await do_pests(interaction,self.uid)
 
-    @discord.ui.button(label='Growth Potion',emoji='🧪',style=discord.ButtonStyle.secondary,row=1)
+    @discord.ui.button(label='Potion · 400c',emoji='🧪',style=discord.ButtonStyle.secondary,row=1)
     async def potion(self,interaction,button):
         await do_potion(interaction,self.uid)
 
@@ -381,11 +439,169 @@ class FarmView(discord.ui.View):
     async def deliveries(self,interaction,button):
         await show_deliveries(interaction,self.uid)
 
+    @discord.ui.button(label='Animals', emoji='🐾', style=discord.ButtonStyle.success, row=2)
+    async def animals(self, interaction, button):
+        await show_animals(interaction, self.uid)
+
     @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=3)
     async def close(self, interaction, button):
         # Explicitly dismiss only this private farm panel when the player chooses.
         await interaction.response.edit_message(view=None)
         self.stop()
+
+
+class AnimalView(discord.ui.View):
+    def __init__(self, uid):
+        super().__init__(timeout=900)
+        self.uid = uid
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message('Open your own farm to manage animals.', ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Buy Chicken',emoji='🐔',style=discord.ButtonStyle.success,row=0)
+    async def chicken(self, interaction, button):
+        await animal_purchase(interaction,self.uid,'chicken')
+
+    @discord.ui.button(label='Buy Pig',emoji='🐷',style=discord.ButtonStyle.success,row=0)
+    async def pig(self, interaction, button):
+        await animal_purchase(interaction,self.uid,'pig')
+
+    @discord.ui.button(label='Buy Cow',emoji='🐄',style=discord.ButtonStyle.success,row=0)
+    async def cow(self, interaction, button):
+        await animal_purchase(interaction,self.uid,'cow')
+
+    @discord.ui.button(label='Collect Produce',emoji='🧺',style=discord.ButtonStyle.primary,row=1)
+    async def collect(self, interaction, button):
+        await animal_collect(interaction,self.uid)
+
+    @discord.ui.button(label='Sell Produce',emoji='🪙',style=discord.ButtonStyle.primary,row=1)
+    async def sell(self, interaction, button):
+        await animal_sell(interaction,self.uid)
+
+    @discord.ui.button(label='Sell Animal',emoji='🔄',style=discord.ButtonStyle.secondary,row=2)
+    async def resell(self, interaction, button):
+        async with lock:
+            animals=list(con.execute('SELECT id,species FROM livestock WHERE user_id=? ORDER BY id',(self.uid,)))
+        if not animals:
+            await interaction.response.send_message('You have no animals to sell.',ephemeral=True)
+            return
+        await interaction.response.send_message('Choose an animal to sell for 50% of its purchase price. **Collect its produce first**; uncollected batches are lost when sold.',view=AnimalSellView(self.uid,animals),ephemeral=True)
+
+    @discord.ui.button(label='Back to Farm',emoji='↩️',style=discord.ButtonStyle.secondary,row=2)
+    async def back(self, interaction, button):
+        await show_farm(interaction,edit_existing=True)
+
+
+def animals_embed(uid):
+    p=player(uid)
+    rows=list(con.execute('SELECT * FROM livestock WHERE user_id=? ORDER BY id',(uid,)))
+    inv=list(con.execute('SELECT species,qty FROM animal_inventory WHERE user_id=? AND qty>0',(uid,)))
+    lines=[]
+    now=int(time.time())
+    for a in rows:
+        species=ANIMALS[a['species']]
+        batches=livestock_batches(a,now)
+        next_ts=a['last_collection_ts']+species['hours']*3600
+        status=(f'🧺 {batches}/2 ready' if batches else f'⏳ Next <t:{next_ts}:R>')
+        lines.append(f'**#{a["id"]} {species["name"]}** · {status}')
+    desc=(f'**Animals:** {len(rows)}/{ANIMAL_LIMIT}  •  **Coins:** {p["coins"]:,}c\n'
+          'Each animal stores **up to two batches**. Production pauses when full.\n'
+          'Collect produce, then sell it separately. No planting actions needed.\n\n'
+          + ('\n'.join(lines) if lines else '*No animals yet.*'))
+    embed=make_embed('🐾 Your Farm Animals',desc[:4000],AUTUMN['green'])
+    embed.add_field(name='🛒 Animal Shop',value='🐔 Chicken **1,200c** · 🥚 90c / 4h\n🐷 Pig **2,000c** · 🍄 240c / 8h\n🐄 Cow **3,000c** · 🥛 420c / 12h',inline=False)
+    embed.add_field(name='🧺 Collected Produce',value='\n'.join(f"{ANIMALS[r['species']]['produce']} ×{r['qty']} · {r['qty']*ANIMALS[r['species']]['sale']:,}c" for r in inv) or 'None',inline=False)
+    embed.add_field(name='💰 Animal Resale Value',value=f'{livestock_resale(uid):,}c · included in farm value',inline=False)
+    return embed
+
+async def show_animals(interaction,uid,notice=None):
+    async with lock:
+        e=event()
+        if not active(e) or not player(uid):
+            await interaction.response.send_message('The official farm is not active for you.',ephemeral=True)
+            return
+        embed=animals_embed(uid)
+        if notice:embed.add_field(name='Latest action',value=notice[:1000],inline=False)
+    await interaction.response.edit_message(embed=embed,view=AnimalView(uid))
+
+async def animal_purchase(interaction,uid,species):
+    spec=ANIMALS[species]
+    async with lock:
+        e=event();p=player(uid)
+        count=con.execute('SELECT COUNT(*) FROM livestock WHERE user_id=?',(uid,)).fetchone()[0]
+        if not active(e) or not p:msg='The farm is not active.'
+        elif int(time.time())>=e['start_ts']+DURATION-12*3600:msg='Animal purchases close during the final 12 hours.'
+        elif count>=ANIMAL_LIMIT:msg=f'Maximum {ANIMAL_LIMIT} animals reached.'
+        elif p['coins']<spec['cost']:msg=f'Not enough coins for {spec["name"]} ({spec["cost"]:,}c).'
+        else:
+            con.execute('INSERT INTO livestock(user_id,species,last_collection_ts) VALUES(?,?,?)',(uid,species,int(time.time())))
+            con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(spec['cost'],uid))
+            log_action(uid,e,'buy_animal',species,-spec['cost'])
+            con.commit()
+            msg=f'Purchased {spec["name"]} for {spec["cost"]:,}c. First produce in {spec["hours"]} hours.'
+    await show_animals(interaction,uid,msg)
+
+async def animal_collect(interaction,uid):
+    async with lock:
+        e=event();now=int(time.time());totals={}
+        if active(e):
+            for a in con.execute('SELECT * FROM livestock WHERE user_id=?',(uid,)):
+                qty=livestock_batches(a,now)
+                if not qty:continue
+                totals[a['species']]=totals.get(a['species'],0)+qty
+                con.execute('UPDATE livestock SET last_collection_ts=?,notified=0 WHERE id=?',(now,a['id']))
+            for species,qty in totals.items():
+                con.execute('INSERT INTO animal_inventory(user_id,species,qty) VALUES(?,?,?) ON CONFLICT(user_id,species) DO UPDATE SET qty=qty+excluded.qty',(uid,species,qty))
+            if totals:log_action(uid,e,'collect_animals',str(totals))
+            con.commit()
+        msg=('Collected '+', '.join(f'{ANIMALS[k]["produce"]} ×{v}' for k,v in totals.items())+'. Sell whenever you like.' if totals else 'No animal produce is ready yet.')
+    await show_animals(interaction,uid,msg)
+
+async def animal_sell(interaction,uid):
+    async with lock:
+        e=event();total=0;parts=[]
+        if active(e):
+            for r in con.execute('SELECT species,qty FROM animal_inventory WHERE user_id=? AND qty>0',(uid,)):
+                amount=r['qty']*ANIMALS[r['species']]['sale']
+                total+=amount;parts.append(f'{ANIMALS[r["species"]]["produce"]} ×{r["qty"]}')
+            if total:
+                con.execute('UPDATE players SET coins=coins+?,sold=sold+? WHERE user_id=?',(total,total,uid))
+                con.execute('DELETE FROM animal_inventory WHERE user_id=?',(uid,))
+                log_action(uid,e,'sell_animal_produce',', '.join(parts),total)
+                con.commit()
+        msg=f'Sold {", ".join(parts)} for **{total:,}c**.' if total else 'No collected animal produce to sell.'
+    await show_animals(interaction,uid,msg)
+
+class AnimalSellSelect(discord.ui.Select):
+    def __init__(self,animals):
+        super().__init__(placeholder='Select animal to sell',options=[discord.SelectOption(label=f'#{a["id"]} {ANIMALS[a["species"]]["name"]} — {ANIMALS[a["species"]]["cost"]//2}c',value=str(a['id'])) for a in animals[:25]])
+    async def callback(self,interaction):
+        uid=interaction.user.id
+        async with lock:
+            e=event();a=con.execute('SELECT * FROM livestock WHERE id=? AND user_id=?',(int(self.values[0]),uid)).fetchone()
+            if not active(e) or not a:msg='Animal unavailable or event inactive.'
+            else:
+                refund=ANIMALS[a['species']]['cost']//2
+                con.execute('DELETE FROM livestock WHERE id=? AND user_id=?',(a['id'],uid))
+                con.execute('UPDATE players SET coins=coins+? WHERE user_id=?',(refund,uid))
+                log_action(uid,e,'sell_animal',a['species'],refund)
+                con.commit()
+                msg=f'Sold {ANIMALS[a["species"]]["name"]} for {refund:,}c.'
+        await interaction.response.edit_message(content=msg,view=None)
+
+class AnimalSellView(discord.ui.View):
+    def __init__(self,uid,animals):
+        super().__init__(timeout=180)
+        self.uid=uid
+        self.add_item(AnimalSellSelect(animals))
+    async def interaction_check(self,interaction):
+        if interaction.user.id!=self.uid:
+            await interaction.response.send_message('This menu belongs to another player.',ephemeral=True)
+            return False
+        return True
 
 
 class CropSelect(discord.ui.Select):
@@ -555,43 +771,26 @@ async def do_pests(interaction, uid):
     await show_farm(interaction,latest_action=f'🐛 Removed pests from {len(rows)} crops for free.',edit_existing=True)
 
 async def do_potion(interaction, uid):
-    # Calculate the reduction from the exact same authoritative timestamp
-    # that the farm panel and harvesting checks use.
     async with lock:
         e=event(); msg='The game is not active.'
         if active(e) and player(uid):
-            now=int(time.time()); day=min(6,(now-e['start_ts'])//86400)
+            now=int(time.time());day=min(6,(now-e['start_ts'])//86400)
             p=player(uid)
             bought=con.execute('SELECT bought FROM potions WHERE user_id=? AND day=?',(uid,day)).fetchone()
-            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,))
-                  if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
-            if bought and bought['bought']>=2:
-                msg='You have already purchased 2 Growth Potions today.'
-            elif p['coins']<POTION_PRICE:
-                msg='You need 400 coins for a Growth Potion.'
-            elif not rows:
-                msg='No eligible crops: at least 1 hour must remain and each crop can only receive one potion.'
+            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,)) if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
+            if bought and bought['bought']>=2:msg='You have already purchased 2 potions today.'
+            elif p['coins']<POTION_PRICE:msg='You need 400 coins for a Growth Potion.'
+            elif not rows:msg='No eligible crops: potions require at least 1 hour remaining and can only be used once per crop.'
             else:
                 savings=[]
                 for r in rows:
-                    before_ts=crop_ready_ts(r,e)
-                    before_remaining=max(0,before_ts-now)
-                    reduction=max(1,int(before_remaining*0.20))
-                    con.execute('UPDATE plots SET potion_used=1, potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',
-                                (reduction,uid,r['slot']))
-                    # Read the persisted plot again: display and harvest checks must agree.
-                    updated=con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,r['slot'])).fetchone()
-                    after_ts=crop_ready_ts(updated,e)
-                    savings.append((r['slot'],before_ts,after_ts,before_ts-after_ts))
+                    reduction=int((crop_ready_ts(r,e)-now)*0.20)
+                    savings.append((r['slot'],reduction))
+                    con.execute('UPDATE plots SET potion_used=1,potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',(reduction,uid,r['slot']))
                 con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(POTION_PRICE,uid))
                 con.execute('INSERT INTO potions(user_id,day,bought) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET bought=bought+1',(uid,day))
                 log_action(uid,e,'growth_potion',f'{len(rows)} crops',-POTION_PRICE)
-                con.commit()
-                def fmt(seconds):
-                    minutes=(max(0,seconds)+59)//60
-                    return f'{minutes//60}h {minutes%60:02d}m'
-                msg=('🧪 **Growth Potion applied** (400c) to '+str(len(rows))+' crops.\n'+
-                     '\n'.join(f'**Plot {slot}:** {fmt(before-now)} → **{fmt(after-now)}** (saved {saved//60}m)' for slot,before,after,saved in savings))
+                msg='🧪 Potion applied to '+str(len(rows))+' crops (400c). Saved: '+', '.join(f'plot {slot}: {seconds//60}m' for slot,seconds in savings)+'. See updated timers below.'
             con.commit()
     await show_farm(interaction,latest_action=msg,edit_existing=True)
 
@@ -661,7 +860,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
                 hours_left, minutes_left = divmod((remaining + 59)//60, 60)
                 duration = f'{hours_left}h {minutes_left:02d}m' if hours_left else f'{minutes_left}m'
                 potion_mark = ' 🧪 Potion applied' if r['potion_used'] else ''
-                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready**' if remaining==0 else f'⏳ **{duration} left** · ready <t:{ready_ts}:t>' + potion_mark + care))
+                lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready**' if remaining==0 else f'⏳ **{duration} left** · <t:{ready_ts}:t>' + potion_mark + care))
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
         embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 7**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
         condition=current_conditions(e)
@@ -679,6 +878,11 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
         embed.add_field(name='🌱 Plots Owned',value=f'{available_plots(p)}/{PLOTS + UPGRADES["extra_plot"]["max"]} · {len(plots)} occupied · {available_plots(p)-len(plots)} empty',inline=False)
         embed.add_field(name='🌾 Your Growing Plots',value='\n'.join(lines)[:1024],inline=False)
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
+        owned=con.execute('SELECT COUNT(*) FROM livestock WHERE user_id=?',(uid,)).fetchone()[0]
+        ready_animals=sum(livestock_batches(a) for a in con.execute('SELECT * FROM livestock WHERE user_id=?',(uid,)))
+        animal_inv=', '.join(f"{ANIMALS[r['species']]['produce']} ×{r['qty']}" for r in con.execute('SELECT * FROM animal_inventory WHERE user_id=? AND qty>0',(uid,))) or 'None'
+        embed.add_field(name='🐾 Livestock',value=f'**{owned}/{ANIMAL_LIMIT} animals** · {ready_animals} batches ready\nStored produce: {animal_inv}\nUse **Animals** to collect or sell.',inline=False)
+
         embed.add_field(name='📊 Your Season So Far',value=f'🌱 Planted **{p["planted"]}**  •  🧺 Harvested **{p["harvested"]}**\n🪙 Sales Revenue **{p["sold"]:,}c**',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
         # Official farm uses persistent delivery orders, not TestFarmView state.
@@ -1080,7 +1284,7 @@ async def leaderboard(interaction:discord.Interaction):
         if mine and mine>15: desc+=f'\n\n**Your rank:** #{mine} — {ranks[mine-1][0]:,} farm value'
         embed=make_embed('🏆 Autumn Harvest Leaderboard',desc, AUTUMN['gold'])
         embed.set_footer(text='Ties: farm value → total sales → harvest count → earlier registration → Discord ID.')
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 @harvest.command(name='rules',description='Learn the game rules')
 async def rules(interaction:discord.Interaction):
@@ -1096,59 +1300,53 @@ async def rules(interaction:discord.Interaction):
 
 @harvest.command(name='help', description='Complete guide to Harvest Hustle, commands, missions and prizes')
 async def harvest_help(interaction: discord.Interaction):
-    intro = make_embed('🌾 Harvest Hustle | Getting Started',
-        '**Event:** 8 November 2026, 00:00 GMT → 15 November 2026, 00:00 GMT (7 days).\n'
-        '**Objective:** Finish with the highest-value farm.\n\n'
-        '**How to join:** Use the Join button on the host-posted announcement in the game channel; the separate role panel grants access to event channels.\n\n'
-        '**Starting farm:** 2,000 coins, 10 plots, and 10 planting actions per 12-hour session. Each additional plot adds one planting action (maximum 20 plots/actions). '
-        '**Unused actions do not carry over.** Only planting consumes actions; growing continues in real time.\n\n'
-        '**Your routine:** Open `/harvest farm` → Plant → Water when thirsty → Harvest Ready → Sell Produce, or save harvested inventory for deliveries or a better market price.\n'
-        '**Privacy:** Farm menus and action responses are private (ephemeral). The bot may DM crop, thirst and pest alerts if your Discord privacy settings permit it.')
-    crops='\n'.join(f"{v['name']} — grows **{v['hours']}h**, seed **{v['cost']}c**, normal sale **{v['sale']}c**" for v in CROPS.values())
-    farm = make_embed('🎮 Farm Buttons & Crop Care',
-        '**🌱 Plant:** Choose seeds for an empty plot; costs seed coins and 1 planting action.\n'
-        '**🧺 Harvest Ready:** Collect all mature crops into inventory; free, no action used.\n'
-        '**🪙 Sell Produce:** Sell stored crops at current market/stall rates; sells your available produce, so check deliveries first.\n'
-        '**💧 Water:** Water thirsty crops for free. Crops become thirsty halfway through normal growth and trigger a DM. Without watering they take **25% longer**.\n'
-        '**🐛 Remove Pests:** Clear infestations for free. Untreated affected crops grow **15% slower**; pests never destroy crops.\n'
-        '**🧪 Growth Potion:** Costs **400c**, reduces **remaining time by 20%** on up to **5 eligible growing crops**, maximum **2 purchases per event day**, once per crop. Does not use planting actions.\n'
-        '**⬆️ Upgrades:** Buy plots or market-stall levels; coins required but no planting action.\n'
-        '**🎯 Missions:** Track daily objectives and click **Claim Rewards** to collect coins.\n'
-        '**🚚 Deliveries:** View active crop orders, their deadlines and rewards; deliver the required harvested inventory.\n'
-        '**🔄 Refresh:** Reopen your farm view to see updated crop timers and values.\n'
-        '**✖️ Close:** Dismiss the private control panel.\n\n'
-        '**Tip:** Growth Potions shorten the actual harvest timer; refresh your farm to see the updated remaining time.')
-    economy = make_embed('🌱 Crops, Upgrades & Missions',
-        '**Crop guide (before weather/market effects)**\n'+crops+'\n\n'
-        '**Extra plots:** Plots 11–14 cost **500c** each, 15–17 **900c**, and 18–20 **1,500c**; resale value is **50%** of purchase price.\n'
-        '**Market Stall:** **1,200c** per level, up to **2 levels**, **+6%** selling price per level (+12% maximum); resale **600c** per level.\n\n'
-        '**Daily missions — manually claim rewards**\n'
+    intro = make_embed('🌾 Harvest Hustle | How to Play',
+        '**Goal:** Build the highest-value farm over **7 days**, starting **8 November 2026 at 00:00 GMT**.\n\n'
+        '**Joining the event**\n'
+        'First, react to the original role panel to access the event channels. Then, when the host posts the separate **Join Harvest Hustle** announcement in the main game channel, click its **Join** button. **No join slash command and no 24-hour registration wait.**\n\n'
+        '**Getting started**\n'
+        '1. Click the **Join Harvest Hustle** button in the host announcement.\n'
+        '2. Once farming begins, use `/harvest farm` to open your private controls.\n'
+        '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; each planting uses **1 action**. Crops become thirsty halfway through growth; the bot sends a DM. Use **Water Crops** to water affected crops for free. Unwatered crops take 25% longer to mature.\n'
+        '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
+        '5. Click **Sell Produce** to sell everything in your inventory for coins. Harvesting and selling are **free actions**.\n\n'
+        '**Starting resources:** 2,000 in-game coins, 10 plots and **10 planting actions per 12-hour session**, increasing by one action for each extra plot purchased (up to 20). Unused actions do not carry over. Crops grow in real time, independent of action resets.\n\n'
+        '**Private updates:** Farm actions appear privately in the game channel. Discord controls how long ephemeral messages stay visible. Use **Save Farm to DMs** for a lasting copy.\n\n'
+        '**Crop readiness:** The bot displays relative ready times and attempts to DM you when crops mature. If DMs are disabled, check `/harvest farm` yourself. Ready crops remain available until harvested.')
+    crops = '\n'.join(f"{v['name']} — **{v['hours']}h** · Seed **{v['cost']}c** · Sell **{v['sale']}c**" for v in CROPS.values())
+    economy = make_embed('🌱 Crops, Upgrades & Daily Missions',
+        '**Crop guide**\n' + crops + '\n\n'
+        '**Expand your farm**\n'
+        '🌱 Extra plots: **500c each** for plots 11–14, **900c each** for plots 15–17 and **1,500c each** for plots 18–20. Maximum **20 plots**. Each purchased plot adds one planting space **and one planting action per 12-hour session**. Resale value: **50% of purchase price**.\n'
+        '🛒 Market Stall: **1,200c** per level, up to **2 levels**. Each level increases produce sale prices by **6%** (maximum +12%). Resale value: **600c** per level.\n\n'
+        '**Three daily missions** (claim via the **Claim Rewards** button)\n'
         '• Plant 2 crops: **+50c**\n'
         '• Harvest 2 crops: **+75c**\n'
-        '• Sell at least once: **+100c**\n'
-        '• Finish all three: **+75c bonus**\n'
-        'Maximum **300c per day**. Claim before the event day resets. Harvest milestones at 5, 15, 30 and 50 are recognition-only.')
-    events = make_embed('🌦️ Six-Hour Events & Strategy',
-        '**Every six hours (00:00 / 06:00 / 12:00 / 18:00 GMT):** The bot updates shared weather, market prices and delivery opportunities.\n\n'
-        '**Weather:** ☀️ Sunshine makes newly planted crops grow **10% faster**; 🌧️ Rainfall and 💦 Irrigation automatically water thirsty crops; 🍃 Autumn Breeze gives eligible new crops a **5% sale bonus**; 🌤️ Clear Skies has no effect.\n'
-        '**Market trends:** A selected crop changes price between **−10% and +15%** for the cycle. Market-stall bonuses also apply. Watch prices before selling.\n'
-        '**Harvest deliveries:** New orders arrive every **6 hours**, with **12-hour quick**, **18-hour standard**, or **24-hour premium** deadlines. Orders pay approximately **18% above normal crop sale value** and consume the required harvested inventory. A forecast appears six hours ahead.\n'
-        '**Pests:** An eligible farm has a **10% chance per six-hour cycle** of an infestation, affecting up to **3 crops**. The bot DMs you; use Remove Pests for free.\n'
-        '**Growth Potions:** Most useful for a delivery deadline, market opportunity or the end of the competition; they do not grant extra planting actions.')
-    finish = make_embed('🏆 Scoring, Prizes & Commands',
-        '**Final score:** Coins + harvested inventory valued at sale price + upgrade resale values. **Unharvested growing crops count as zero** when the event ends.\n'
-        '**Tiebreakers:** Lifetime sales revenue → total crops harvested → earliest join → Discord user ID.\n\n'
+        '• Sell produce at least once: **+100c**\n'
+        '• Complete all three: **+75c daily bonus**\n'
+        'Missions reset each event day. Open objectives and press **Claim Rewards** to collect earned rewards **before the next day**. Maximum **300c per day** (2,100c over seven days). Harvest milestones (5/15/30/50) are recognition-only.\n\n'
+        '**Livestock — up to 10 animals total**\n'
+        '🐔 Chicken: **900c**, eggs worth **90c** every **4h**\n'
+        '🐷 Pig: **1,600c**, truffles worth **240c** every **8h**\n'
+        '🐄 Cow: **2,400c**, milk worth **420c** every **12h**\n'
+        'Buy multiple animals of the same type via **Farm → Animals**. Each stores up to **2 batches** before production pauses. The bot attempts to DM you when produce is ready; collect and sell separately. Animals do not use crop plots or planting actions. Animal resale value is **50%**; purchases close in the final **12h**.')
+    finish = make_embed('🏆 Winning, Prizes & Commands',
+        '**Final farm value** = remaining coins + harvested crop and animal produce in inventory at sale value + plot, stall and animal resale values. **Unharvested crops and uncollected animal produce are worth 0 at event closing.**\n'
+        'Ties: lifetime produce sales → crops harvested → earlier registration → Discord user ID.\n\n'
         '**Prizes**\n🥇 **200 Habbo credits + HC Box**\n🥈 **100 Habbo credits + HC Box**\n🥉 **75 Habbo credits + HC Box**\n\n'
         '**Player commands**\n'
-        '`/harvest farm` — Private farm controls\n'
-        '`/harvest help` — Complete guide\n'
-        '`/harvest rules` — Short rules\n'
-        '`/harvest objectives` — Daily missions and claims\n'
-        '`/harvest leaderboard` — Current rankings\n'
-        '`/harvest stats` — Your farming statistics\n'
-        '`/harvest status` — Event timing and participation\n\n'
-        '**Important:** Farm coins are in-game currency; Habbo credits are prizes only. Farm buttons are private, but automated event announcements are shared.')
-    await interaction.response.send_message(embeds=[intro,farm,economy,events,finish],ephemeral=True)
+        '`/harvest help` — This guide\n'
+        '`/harvest rules` — Rules summary\n'
+        'Registration — Click **Join Harvest Hustle** in the host announcement\n'
+        '`/harvest farm` — Open your farm: **Plant**, **Harvest**, **Sell**, **Water**, **Remove Pests**, **Growth Potion**, **Deliveries**, **Animals**, **Upgrades** and **Refresh**\n'
+        '`/harvest objectives` — View daily missions and press **Claim Rewards** before the next event day\n'
+        '`/harvest leaderboard` — Rankings\n'
+        '`/harvest stats` — Your farm statistics\n'
+        '`/harvest status` — Event schedule\n\n'
+        '**Six-hour events:** Weather and crop market prices update at **00:00, 06:00, 12:00 and 18:00 GMT**. Deliveries have limited deadlines; pest and irrigation events may affect crops.\n'
+        '**Growth Potions:** **400c**, reduce remaining growth time by **20%** for up to **5 crops**, maximum **2 purchases daily** and **once per crop**.\n\n'
+        '**Fair play:** No planting-action carryover. All coin amounts above are **in-game coins** unless explicitly described as Habbo credits.')
+    await interaction.response.send_message(embeds=[intro, economy, finish], ephemeral=True)
 
 @harvest.command(name='status',description='Check event timing and player count')
 async def status(interaction:discord.Interaction):
@@ -1171,7 +1369,7 @@ async def reset(interaction:discord.Interaction,confirm:str):
         e=event()
         if e and not e['ended']: msg='Cannot reset a scheduled or active event.'
         else:
-            for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles'):
+            for table in ('watering_alerts','harvest_alerts','transactions','objective_claims','inventory','plots','players','event','farm_cycles','delivery_orders','delivery_claims','pest_alerts','potions','pest_cycles','livestock','animal_inventory'):
                 con.execute(f'DELETE FROM {table}')
             con.commit()
             msg='Completed event data cleared. You can start a new event.'
@@ -1357,85 +1555,6 @@ async def history(interaction:discord.Interaction,member:discord.User):
     desc='\n'.join(f'{stamp(r["ts"])} · {r["action"]} ({r["detail"]}) · {r["coin_change"]:+,}c' for r in rows) or 'No transactions.'
     await interaction.response.send_message(embed=make_embed(f'📋 Transactions — {member.display_name}',desc[:4000]),ephemeral=True)
 
-def economy_announcement(row, forecast):
-    weather_details = {
-        'sun': '☀️ Sunshine — newly planted crops grow 10% faster.',
-        'rain': '🌧️ Rainfall — thirsty crops are watered automatically.',
-        'breeze': '🍃 Autumn Breeze — newly planted crops earn a 5% sale bonus.',
-        'clear': '🌤️ Clear Skies — normal growing conditions.',
-        'irrigation': '💦 Irrigation — thirsty crops are watered automatically.',
-    }
-    weather = row['weather']
-    market = f'{float(row["market_pct"]):+.0%}'
-    if forecast:
-        crop = CROPS[forecast['crop']]
-        hours = {'quick': 12, 'standard': 18, 'premium': 24}[forecast['kind']]
-        delivery = (f'**{forecast["qty"]} × {crop["name"]}** ({forecast["kind"].title()} order)\n'
-                    f'⏳ **Time to complete:** {hours} hours after the delivery opens\n'
-                    f'📅 **Opens:** <t:{int(forecast["starts"])}:F>\n'
-                    f'🏁 **Deadline:** <t:{int(forecast["ends"])}:F> '
-                    f'(<t:{int(forecast["ends"])}:R>)\n'
-                    f'🌱 **Normal crop growth:** {crop["hours"]} hours '
-                    f'(before weather and watering effects)\n'
-                    f'📢 **Prepare now!** Harvest the required crops before the deadline.')
-    else:
-        delivery = 'Forecast pending'
-    return (f'🌾 **HARVEST HUSTLE — 6-HOUR FARM UPDATE**\n\n'
-            f'🌦️ **Weather:** {weather.replace("_", " ").title()}\n'
-            f'{weather_details.get(weather, "Normal growing conditions.")}\n\n'
-            f'📈 **Crop Market:** {CROPS[row["market_crop"]]["name"]} '
-            f'**{market}** selling price for the next 6 hours.\n\n'
-            f'🚚 **Next Harvest Delivery (in 6 hours):**\n{delivery}\n'
-            f'Active delivery orders can be viewed through **/harvest farm → Harvest Deliveries**.\n\n'
-            f'🐛 **Pest Alerts:** Affected farmers receive a private DM. '
-            f'Use **Remove Pests** to treat crops for free.\n'
-            f'💧 **Crop Care:** Rainfall and irrigation water eligible thirsty crops automatically.\n\n'
-            f'⏰ Next update in **6 hours**. Happy harvesting!')
-
-async def send_economy_announcement(message):
-    if not ANNOUNCEMENT_CHANNEL_ID:
-        logging.error('ANNOUNCEMENT_CHANNEL_ID is not configured')
-        return False
-    channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(ANNOUNCEMENT_CHANNEL_ID)
-        except (discord.Forbidden, discord.HTTPException):
-            logging.exception('Cannot access Harvest announcement channel %s', ANNOUNCEMENT_CHANNEL_ID)
-            return False
-    try:
-        await channel.send(
-            f'<@&{ANNOUNCEMENT_ROLE_ID}>\n{message}' if ANNOUNCEMENT_ROLE_ID else message,
-            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=ANNOUNCEMENT_ROLE_ID)] if ANNOUNCEMENT_ROLE_ID else [], users=False, everyone=False),
-        )
-        return True
-    except (discord.Forbidden, discord.HTTPException):
-        logging.exception('Unable to post Harvest update to channel %s', ANNOUNCEMENT_CHANNEL_ID)
-        return False
-
-@harvest.command(name='announcement-test', description='Host only: privately preview the six-hour announcement (no ping or channel post)')
-async def announcement_test(interaction: discord.Interaction):
-    if not is_host(interaction):
-        await interaction.response.send_message('Host only.', ephemeral=True)
-        return
-    async with lock:
-        e = event()
-        if e is None:
-            await interaction.response.send_message('No Harvest event is scheduled.', ephemeral=True)
-            return
-        n = cycle_number(e) if active(e) else 0
-        row = ensure_cycle(e, n)
-        ensure_delivery(e, n+1)
-        forecast = con.execute('SELECT * FROM delivery_orders WHERE cycle=?', (n+1,)).fetchone()
-        con.commit()
-        preview = economy_announcement(row, forecast)
-    await interaction.response.send_message(
-        f'🔒 **PRIVATE ANNOUNCEMENT PREVIEW — ONLY YOU CAN SEE THIS**\n'
-        f'No message has been sent to <#{ANNOUNCEMENT_CHANNEL_ID}> and no role has been pinged.\n\n'
-        f'{preview}', ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
 async def send_announcement_checked(message,ping=False):
     if not CHANNEL_ID: return False
     channel=bot.get_channel(CHANNEL_ID)
@@ -1526,6 +1645,35 @@ async def harvest_alert_watcher():
                 con.commit()
 
 @tasks.loop(minutes=1)
+async def animal_alert_watcher():
+    async with lock:
+        e=event()
+        if not active(e) or e['live_test']:return
+        due={}
+        for a in con.execute('SELECT * FROM livestock WHERE notified=0'):
+            if livestock_batches(a)>0:
+                due.setdefault(a['user_id'],[]).append((a['id'],a['species']))
+        # Claim notifications before sending, to avoid duplicate DMs on overlapping ticks.
+        for items in due.values():
+            for animal_id,_ in items:
+                con.execute('UPDATE livestock SET notified=1 WHERE id=?',(animal_id,))
+        con.commit()
+    for uid,items in due.items():
+        try:
+            user=bot.get_user(uid) or await bot.fetch_user(uid)
+            names=', '.join(f'{ANIMALS[species]["name"]} #{animal_id}' for animal_id,species in items)
+            await user.send(f'🐾 **Harvest Hustle — Animal Produce Ready!**\n'
+                            f'{names} have produce ready to collect.\n'
+                            'Open **`/harvest farm` → Animals → Collect Produce**, '
+                            'then **Sell Produce** to earn coins. Each animal stores up to 2 batches.')
+        except (discord.Forbidden,discord.HTTPException) as exc:
+            logging.info('Animal produce DM blocked for %s: %s',uid,exc)
+
+@animal_alert_watcher.before_loop
+async def before_animal_alerts():
+    await bot.wait_until_ready()
+
+@tasks.loop(minutes=1)
 async def economy_watcher():
     async with lock:
         e=event()
@@ -1547,18 +1695,19 @@ async def economy_watcher():
                 con.execute('UPDATE plots SET pest_penalty=1 WHERE user_id=? AND slot=?',(uid,r['slot']))
                 con.execute('INSERT OR IGNORE INTO pest_alerts(user_id,slot,planted_ts) VALUES(?,?,?)',(uid,r['slot'],r['planted_ts']))
         announced=bool(row['announced'])
+        if not announced:con.execute('UPDATE farm_cycles SET announced=1 WHERE cycle=?',(n,))
         alerts=list(con.execute('SELECT user_id,COUNT(*) AS qty FROM pest_alerts WHERE alerted=0 GROUP BY user_id'))
         con.execute('UPDATE pest_alerts SET alerted=1 WHERE alerted=0')
         forecast=con.execute('SELECT * FROM delivery_orders WHERE cycle=?',(n+1,)).fetchone()
         con.commit()
     if not announced:
-        # Only mark the cycle as announced after Discord confirms the post.
-        # A failed send is retried on the next watcher iteration.
-        sent = await send_economy_announcement(economy_announcement(row, forecast))
-        if sent:
-            async with lock:
-                con.execute('UPDATE farm_cycles SET announced=1 WHERE cycle=?', (n,))
-                con.commit()
+        pct=f'{row["market_pct"]:+.0%}'
+        msg=(f'🌦️ **HARVEST WEATHER — {row["weather"].upper()}** (6 hours)\n'
+             f'📈 **MARKET:** {CROPS[row["market_crop"]]["name"]} {pct} sale price.\n'
+             '☀️ Sunshine: new crops grow 10% faster. 🌧️ Rain/Irrigation: thirsty crops watered automatically. 🍃 Breeze: new crops get +5% harvest bonus.\n'
+             f'🚚 **NEXT DELIVERY IN 6 HOURS:** {forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} ({forecast["kind"]}).\n'
+             'Open **/harvest farm** → **Harvest Deliveries** for currently active orders.')
+        await send_announcement_checked(msg)
     for r in alerts:
         try:
             user=bot.get_user(r['user_id']) or await bot.fetch_user(r['user_id'])
@@ -1933,6 +2082,18 @@ class HarvestTestView(discord.ui.View):
             msg='⚠️ Could not deliver the test DM. Check your Discord DM privacy settings and try again.'
         await self.refresh(interaction, msg)
 
+    @discord.ui.button(label='Save Farm to DMs', emoji='📩', style=discord.ButtonStyle.secondary, row=3)
+    async def save_test(self, interaction, button):
+        try:
+            await interaction.user.send(embed=self.summary())
+            await interaction.response.send_message('📩 A copy of your test farm was sent to your DMs, where it will remain available.', ephemeral=True)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message('I could not send a DM. Please enable server DMs for the bot.', ephemeral=True)
+
+    @discord.ui.button(label='Animals', emoji='🐾', style=discord.ButtonStyle.success, row=2)
+    async def animals(self, interaction, button):
+        await show_animals(interaction, self.uid)
+
     @discord.ui.button(label='Close', emoji='✖️', style=discord.ButtonStyle.secondary, row=3)
     async def close_test(self, interaction, button):
         await interaction.response.edit_message(view=None)
@@ -2033,6 +2194,8 @@ async def main():
             watering_alert_watcher.start()
         if not economy_watcher.is_running():
             economy_watcher.start()
+        if not animal_alert_watcher.is_running():
+            animal_alert_watcher.start()
 
         await bot.connect(reconnect=True)
 
