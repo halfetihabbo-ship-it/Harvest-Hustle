@@ -682,8 +682,14 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
         embed.add_field(name='🧺 Inventory',value=inv,inline=False)
         embed.add_field(name='📊 Your Season So Far',value=f'🌱 Planted **{p["planted"]}**  •  🧺 Harvested **{p["harvested"]}**\n🪙 Sales Revenue **{p["sold"]:,}c**',inline=False)
         embed.add_field(name='⬆️ Upgrades',value=f'Extra plots: {p["extra_plot"]}/10 · Market stalls: {p["market"]}/2',inline=False)
-        deliveries=[f'{qty} × {CROPS[crop]["name"]} → {reward}c (ends hour {end})' for cycle,(crop,qty,reward,end) in self.test_deliveries.items() if cycle not in self.delivered and cycle*6<=self.test_hour<end]
-        if deliveries:embed.add_field(name='🚚 Active Test Deliveries',value='\n'.join(deliveries[-3:]),inline=False)
+        # Official farm uses persistent delivery orders, not TestFarmView state.
+        orders = active_orders(e) if e else []
+        if orders:
+            order_lines = []
+            for order in orders[-3:]:
+                claimed = con.execute('SELECT 1 FROM delivery_claims WHERE user_id=? AND cycle=?', (uid, order['cycle'])).fetchone()
+                order_lines.append(f'{order["qty"]} × {CROPS[order["crop"]]["name"]} → {order["reward"]}c · ends {stamp(order["ends"])}' + (' · ✅ Delivered' if claimed else ''))
+            embed.add_field(name='🚚 Active Deliveries', value='\n'.join(order_lines)[:1024], inline=False)
         if latest_action:
             embed.add_field(name='🍂 LATEST ACTION', value=latest_action[:1024], inline=False)
         embed.set_footer(text='When a crop is ready, click Harvest Ready, then Sell Produce. Only planting uses actions.')
