@@ -16,6 +16,7 @@ TOKEN = os.environ.get('DISCORD_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID', '0'))
 HOST_IDS = {int(x.strip()) for x in os.environ.get('HOST_IDS', '1501587787294703657').split(',') if x.strip()}
 CHANNEL_ID = 1567980153039098028  # Official game channel; fixed to avoid stale Railway EVENT_CHANNEL_ID
+ECONOMY_CHANNEL_ID = 1568316136104140810  # Six-hour weather and market announcements
 ROLE_PANEL_CHANNEL_ID = int(os.environ.get('ROLE_PANEL_CHANNEL_ID', '1567980502965551144'))
 ROLE_ID = int(os.environ.get('EVENT_ROLE_ID', '1567982021106602065'))
 DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
@@ -1337,7 +1338,7 @@ async def leaderboard(interaction:discord.Interaction):
         if mine and mine>15: desc+=f'\n\n**Your rank:** #{mine} — {ranks[mine-1][0]:,} farm value'
         embed=make_embed('🏆 Autumn Harvest Leaderboard',desc, AUTUMN['gold'])
         embed.set_footer(text='Ties: farm value → total sales → harvest count → earlier registration → Discord ID.')
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @harvest.command(name='rules',description='Learn the game rules')
 async def rules(interaction:discord.Interaction):
@@ -1608,11 +1609,12 @@ async def history(interaction:discord.Interaction,member:discord.User):
     desc='\n'.join(f'{stamp(r["ts"])} · {r["action"]} ({r["detail"]}) · {r["coin_change"]:+,}c' for r in rows) or 'No transactions.'
     await interaction.response.send_message(embed=make_embed(f'📋 Transactions — {member.display_name}',desc[:4000]),ephemeral=True)
 
-async def send_announcement_checked(message,ping=False):
-    if not CHANNEL_ID: return False
-    channel=bot.get_channel(CHANNEL_ID)
+async def send_announcement_checked(message,ping=False,channel_id=None):
+    target_channel_id = CHANNEL_ID if channel_id is None else channel_id
+    if not target_channel_id: return False
+    channel=bot.get_channel(target_channel_id)
     if channel is None:
-        try: channel=await bot.fetch_channel(CHANNEL_ID)
+        try: channel=await bot.fetch_channel(target_channel_id)
         except (discord.HTTPException,discord.Forbidden): return False
     content=(f'<@&{ROLE_ID}>\n' if ping and ROLE_ID else '')+message
     try:
@@ -1760,7 +1762,7 @@ async def economy_watcher():
              '☀️ Sunshine: new crops grow 10% faster. 🌧️ Rain/Irrigation: thirsty crops watered automatically. 🍃 Breeze: new crops get +5% harvest bonus.\n'
              f'🚚 **NEXT DELIVERY IN 6 HOURS:** {forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} ({forecast["kind"]}).\n'
              'Open **/harvest farm** → **Harvest Deliveries** for currently active orders.')
-        await send_announcement_checked(msg)
+        await send_announcement_checked(msg, channel_id=ECONOMY_CHANNEL_ID)
     for r in alerts:
         try:
             user=bot.get_user(r['user_id']) or await bot.fetch_user(r['user_id'])
