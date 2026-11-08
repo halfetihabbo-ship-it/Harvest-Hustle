@@ -829,29 +829,92 @@ async def do_pests(interaction, uid):
             con.commit()
     await show_farm(interaction,latest_action=f'🐛 Removed pests from {len(rows)} crops for free.',edit_existing=True)
 
+def potion_eligible(uid, e, now):
+    return [r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,))
+            if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600]
+
+class PotionPlotSelect(discord.ui.Select):
+    def __init__(self, rows, e, now):
+        options=[discord.SelectOption(label=f"Plot {r['slot']} — {CROPS[r['crop']]['name']}",
+                 value=str(r['slot']), description=f"{(crop_ready_ts(r,e)-now)//60} min left · saves ~{int((crop_ready_ts(r,e)-now)*.2)//60} min") for r in rows[:25]]
+        super().__init__(placeholder='Choose 1–5 crops for your potion', min_values=1,
+                         max_values=min(5,len(options)), options=options)
+    async def callback(self, interaction):
+        view=self.view
+        view.selected=tuple(int(v) for v in self.values)
+        await interaction.response.edit_message(embed=make_embed('🧪 Confirm Growth Potion',
+            f"**Selected plots:** {', '.join(str(x) for x in view.selected)}\n"
+            f"**Price:** {POTION_PRICE} coins (charged only on confirmation)\n"
+            '**Effect:** 20% off the remaining growth time for each selected crop.\n'
+            '**Eligibility:** At least 1 hour remaining, once per crop, maximum 5 crops per potion, 2 purchases per day.\n\n'
+            'Press **Confirm Purchase** to apply the potion or **Cancel** to exit.'),view=view)
+
+class PotionPurchaseView(discord.ui.View):
+    def __init__(self, uid, rows, e, now):
+        super().__init__(timeout=180)
+        self.uid=uid
+        self.selected=()
+        self.add_item(PotionPlotSelect(rows,e,now))
+    async def interaction_check(self, interaction):
+        if interaction.user.id!=self.uid:
+            await interaction.response.send_message('This is not your potion menu.',ephemeral=True)
+            return False
+        return True
+    @discord.ui.button(label='Confirm Purchase · 400c',emoji='🧪',style=discord.ButtonStyle.success,row=1)
+    async def confirm(self,interaction,button):
+        if not self.selected:
+            await interaction.response.send_message('Choose your crops from the dropdown first.',ephemeral=True)
+            return
+        async with lock:
+            e=event();p=player(self.uid);now=int(time.time())
+            if not active(e) or not p:msg='The event is no longer active.'
+            else:
+                day=min(6,(now-e['start_ts'])//86400)
+                bought=con.execute('SELECT bought FROM potions WHERE user_id=? AND day=?',(self.uid,day)).fetchone()
+                eligible={r['slot']:r for r in potion_eligible(self.uid,e,now)}
+                if bought and bought['bought']>=2:msg='You have already purchased 2 potions today.'
+                elif p['coins']<POTION_PRICE:msg='You need 400 coins for a Growth Potion.'
+                elif any(slot not in eligible for slot in self.selected):msg='One or more selected crops are no longer eligible. Reopen the potion menu.'
+                else:
+                    savings=[]
+                    for slot in self.selected:
+                        r=eligible[slot]
+                        reduction=int((crop_ready_ts(r,e)-now)*.20)
+                        savings.append((slot,reduction))
+                        con.execute('UPDATE plots SET potion_used=1,potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',(reduction,self.uid,slot))
+                    con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(POTION_PRICE,self.uid))
+                    con.execute('INSERT INTO potions(user_id,day,bought) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET bought=bought+1',(self.uid,day))
+                    log_action(self.uid,e,'growth_potion',f"plots {', '.join(str(x) for x in self.selected)}",-POTION_PRICE)
+                    con.commit()
+                    msg='🧪 Purchased! Applied to '+str(len(savings))+' selected crop(s). Saved: '+', '.join(f'plot {slot}: {seconds//60}m' for slot,seconds in savings)+'.'
+        self.stop()
+        await interaction.response.edit_message(embed=make_embed('🧪 Growth Potion',msg),view=None)
+    @discord.ui.button(label='Cancel',style=discord.ButtonStyle.secondary,row=1)
+    async def cancel(self,interaction,button):
+        self.stop()
+        await interaction.response.edit_message(embed=make_embed('🧪 Growth Potion','Purchase cancelled. No coins were spent.'),view=None)
+
 async def do_potion(interaction, uid):
     async with lock:
-        e=event(); msg='The game is not active.'
-        if active(e) and player(uid):
-            now=int(time.time());day=min(6,(now-e['start_ts'])//86400)
-            p=player(uid)
+        e=event();p=player(uid);now=int(time.time())
+        if not active(e) or not p:
+            msg='The event is not active or you have not joined.';rows=[]
+        else:
+            day=min(6,(now-e['start_ts'])//86400)
             bought=con.execute('SELECT bought FROM potions WHERE user_id=? AND day=?',(uid,day)).fetchone()
-            rows=[r for r in con.execute('SELECT * FROM plots WHERE user_id=? ORDER BY slot',(uid,)) if not r['potion_used'] and crop_ready_ts(r,e)-now>=3600][:5]
-            if bought and bought['bought']>=2:msg='You have already purchased 2 potions today.'
-            elif p['coins']<POTION_PRICE:msg='You need 400 coins for a Growth Potion.'
-            elif not rows:msg='No eligible crops: potions require at least 1 hour remaining and can only be used once per crop.'
-            else:
-                savings=[]
-                for r in rows:
-                    reduction=int((crop_ready_ts(r,e)-now)*0.20)
-                    savings.append((r['slot'],reduction))
-                    con.execute('UPDATE plots SET potion_used=1,potion_seconds=potion_seconds+? WHERE user_id=? AND slot=?',(reduction,uid,r['slot']))
-                con.execute('UPDATE players SET coins=coins-? WHERE user_id=?',(POTION_PRICE,uid))
-                con.execute('INSERT INTO potions(user_id,day,bought) VALUES(?,?,1) ON CONFLICT(user_id,day) DO UPDATE SET bought=bought+1',(uid,day))
-                log_action(uid,e,'growth_potion',f'{len(rows)} crops',-POTION_PRICE)
-                msg='🧪 Potion applied to '+str(len(rows))+' crops (400c). Saved: '+', '.join(f'plot {slot}: {seconds//60}m' for slot,seconds in savings)+'. See updated timers below.'
-            con.commit()
-    await show_farm(interaction,latest_action=msg,edit_existing=True)
+            used=bought['bought'] if bought else 0
+            rows=potion_eligible(uid,e,now)
+            msg=(f'**Price:** {POTION_PRICE} coins · **Your balance:** {p["coins"]:,} coins\n'
+                 '**Effect:** 20% reduction of remaining growth time for each selected crop.\n'
+                 '**Eligibility:** Crops must have at least **1 hour remaining** and must **not have received a potion before**. '
+                 'Choose **1–5 crops** per purchase. Maximum **2 purchases per day**.\n'
+                 f'**Purchases today:** {used}/2 · **Eligible crops:** {len(rows)}\n\n'
+                 'Select your plots below, then press **Confirm Purchase**. Coins are only deducted after confirmation.')
+            if used>=2:msg+='\n\n⚠️ You have reached today’s potion limit.';rows=[]
+            elif p['coins']<POTION_PRICE:msg+='\n\n⚠️ You do not have enough coins.';rows=[]
+            elif not rows:msg+='\n\n⚠️ No eligible crops available.'
+    await interaction.response.send_message(embed=make_embed('🧪 Choose Growth Potion Crops',msg),
+        view=PotionPurchaseView(uid,rows,e,now) if rows else None,ephemeral=True)
 
 async def show_deliveries(interaction, uid):
     async with lock:
@@ -1475,7 +1538,7 @@ async def harvest_help(interaction: discord.Interaction):
         '`/harvest stats` — Your farm statistics\n'
         '`/harvest status` — Event schedule\n\n'
         '**Six-hour events:** Weather and crop market prices update at **00:00, 06:00, 12:00 and 18:00 GMT**. Deliveries have limited deadlines; pest and irrigation events may affect crops.\n'
-        '**Growth Potions:** **400c**, reduce remaining growth time by **20%** for up to **5 crops**, maximum **2 purchases daily** and **once per crop**.\n\n'
+        '**Growth Potions:** **400c**. Choose **1–5 eligible crops** (at least 1 hour remaining; no previous potion on that crop), review eligibility, then **confirm purchase**. Saves **20% of remaining growth time**; maximum **2 purchases daily**.\n\n'
         '**Fair play:** No planting-action carryover. All coin amounts above are **in-game coins** unless explicitly described as Habbo credits.')
     await interaction.response.send_message(embeds=[intro, economy, finish], ephemeral=True)
 
