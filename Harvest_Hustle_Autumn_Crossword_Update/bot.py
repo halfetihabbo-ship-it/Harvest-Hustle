@@ -113,7 +113,7 @@ def crop_ready_ts(plot, event_row):
     # Backward compatibility for farms planted before the timestamp migration.
     if not planted:
         planted = event_row['start_ts'] + plot['planted_window'] * WINDOW
-    return int(planted) + max(60, int(CROPS[plot['crop']]['hours'] * 3600 * (1.0 if plot['boost_used'] else 1.25) * (0.9 if plot['boost_seconds']==1 else 1.0) * (1.15 if plot['pest_penalty'] else 1.0)) - int(plot['potion_seconds']))
+    return int(planted) + max(60, int(CROPS[plot['crop']]['hours'] * 3600 * (0.9 if plot['boost_seconds']==1 else 1.0) * (0.9 if plot['boost_used'] else 1.0) * (1.15 if plot['pest_penalty'] else 1.0)) - int(plot['potion_seconds']))
 
 def crop_thirst_ts(plot, event_row):
     planted = plot['planted_ts'] or event_row['start_ts'] + plot['planted_window'] * WINDOW
@@ -634,7 +634,7 @@ class CropSelect(discord.ui.Select):
                     use_action(uid)
                     con.execute('UPDATE players SET planted=planted+1 WHERE user_id=?',(uid,))
                     log_action(uid,e,'plant',crop,-c['cost'])
-                    msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Estimated harvest: {stamp(crop_ready_ts(con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,free)).fetchone(),e))}, assuming it is watered on time and pests are treated."
+                    msg=f"Planted {c['name']} in plot {free} for {c['cost']} coins. Estimated harvest: {stamp(crop_ready_ts(con.execute('SELECT * FROM plots WHERE user_id=? AND slot=?',(uid,free)).fetchone(),e))}, subject to weather, pests and growth potions."
                 con.commit()
         await show_farm(interaction, latest_action='🌱 **Planting:** ' + msg, edit_existing=True)
 
@@ -686,7 +686,7 @@ async def buy_upgrade(interaction,kind):
     await show_farm(interaction, latest_action='🏡 **Upgrade:** ' + msg, edit_existing=True)
 
 async def do_crop_care(interaction, uid):
-    """Water only thirsty growing crops; restore normal growth time."""
+    """Water thirsty growing crops once for a 10% reduction in growth duration."""
     async with lock:
         e = event()
         if not active(e) or not player(uid):
@@ -701,8 +701,8 @@ async def do_crop_care(interaction, uid):
                             (uid, r['slot']))
             if thirsty:
                 log_action(uid, e, 'crop_care', f'Watered {len(thirsty)} thirsty crops', 0)
-                msg = (f'💧 Watered {len(thirsty)} thirsty crop(s)! They now follow their normal growth schedule. '
-                       'Unwatered crops take 25% longer to mature. No coins spent.')
+                msg = (f'💧 Watered {len(thirsty)} thirsty crop(s)! Watering reduces the growth timer by 10%. '
+                       'No coins spent.')
             else:
                 msg = 'No crops need watering right now. Crops become thirsty halfway through their normal growth time.'
             con.commit()
@@ -1417,7 +1417,7 @@ async def rules(interaction:discord.Interaction):
     crops='\n'.join(f"{v['name']}: seed {v['cost']}c → sells {v['sale']}c · grows {v['hours']} hours" for v in CROPS.values())
     e=make_embed('📖 Harvest Hustle Rules',
         '**Join using the host-posted Join button; late joining is allowed while the event is active.** Seven days, fourteen 12-hour sessions. Planting is **unlimited** as long as you have enough coins and an empty plot. Each player starts with **2,000 coins and 10 plots**.\n\n'
-        '**Plant**: pay the seed cost and use an empty plot; no session action limit. **Water Crops**: crops become thirsty halfway through growth and trigger a DM. Water thirsty crops for free to restore normal growth time; otherwise they take 25% longer. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
+        '**Plant**: pay the seed cost and use an empty plot; no session action limit. **Water Crops**: crops become thirsty halfway through growth and trigger a DM. Water thirsty crops for free; watering reduces the growth timer by 10%. **Harvest**: free, collects ALL ready crops. **Sell**: free, sells ALL stored produce. **Upgrade**: free action (coins required).\n\n'
         '**Crops**\n'+crops+'\n\n'
         '**Upgrades**\n🌱 Extra Plot: 500c for plots 11–14, 900c for 15–17, 1,500c for 18–20; resale is 50% of each plot’s purchase price.\n🛒 Market Stall: 1,200c, up to 2, +6% sale price per level, resale value 600c each.\n\n'
         '**Winner**: coins + stored produce sale value + upgrade resale value. **Growing crops are worth 0 at closing.** Tie order: lifetime sales, total crops harvested, earlier join, then Discord user ID.\n\n'
@@ -1433,7 +1433,7 @@ async def harvest_help(interaction: discord.Interaction):
         '**Getting started**\n'
         '1. Click the **Join Harvest Hustle** button in the host announcement.\n'
         '2. Once farming begins, use `/harvest farm` to open your private controls.\n'
-        '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; planting has no session action limit. Crops become thirsty halfway through growth; the bot sends a DM. Use **Water Crops** to water affected crops for free. Unwatered crops take 25% longer to mature.\n'
+        '3. Select **Plant**, choose a crop and an empty plot. Seeds cost coins; planting has no session action limit. Crops become thirsty halfway through growth; the bot sends a DM. Use **Water Crops** to water affected crops for free. Watering reduces the growth timer by 10%.\n'
         '4. Watch the live crop timer. Once ready, use **Harvest Ready** to collect all mature crops.\n'
         '5. Click **Sell Produce** to sell everything in your inventory for coins. Harvesting and selling are **free actions**.\n\n'
         '**Starting resources:** 2,000 in-game coins and 10 plots. Plant as often as you like when plots are empty and you can afford seeds. Crops grow in real time.\n\n'
@@ -1870,7 +1870,7 @@ async def watering_alert_watcher():
             await user.send('💧 **Harvest Hustle — Your crops need watering!**\n'
                             f'{len(crops)} crop(s) are thirsty ({names}).\n'
                             'Open **`/harvest farm`** and click **💧 Water Crops** to water all affected crops. '
-                            'Without watering, these crops take **25% longer** to mature. '
+                            'Watering reduces their growth timer by 10%. '
                             'Watering is free and uses no planting actions.')
         except (discord.Forbidden, discord.HTTPException) as exc:
             logging.info('Could not DM watering alert to %s: %s', uid, exc)
@@ -1980,7 +1980,7 @@ class HarvestTestView(discord.ui.View):
                 + self.market * UPGRADES['market']['resale'])
 
     def test_crop_hours(self, slot, crop):
-        return CROPS[crop]['hours'] * (1.0 if slot in self.cared_plots else 1.25) * (1.15 if slot in self.pest_plots else 1.0)
+        return CROPS[crop]['hours'] * (0.9 if slot in self.cared_plots else 1.0) * (1.15 if slot in self.pest_plots else 1.0)
 
     def summary(self, latest_action=None):
         lines = []
@@ -2042,14 +2042,14 @@ class HarvestTestView(discord.ui.View):
     @discord.ui.button(label='Water Crops', emoji='💧', style=discord.ButtonStyle.secondary, row=1)
     async def care_test(self, interaction, button):
         growing = [(slot, crop) for slot, (crop, planted) in self.plots.items()
-                   if slot not in self.cared_plots and CROPS[crop]['hours'] * 0.5 <= self.test_hour - planted < CROPS[crop]['hours'] * 1.25]
+                   if slot not in self.cared_plots and CROPS[crop]['hours'] * 0.5 <= self.test_hour - planted < CROPS[crop]['hours']]
         if self.test_hour >= 168:
             msg = 'Test has ended. Reset to start again.'
         elif not growing:
             msg = 'No thirsty growing crops. Advance simulated time until crops reach halfway through growth.'
         else:
             self.cared_plots.update(slot for slot, crop in growing)
-            msg = f'💧 Watered {len(growing)} thirsty crops. Normal growth schedule restored; otherwise growth takes 25% longer. No actions or coins spent.'
+            msg = f'💧 Watered {len(growing)} thirsty crops. Watering reduces the growth timer by 10%. No actions or coins spent.'
         await self.refresh(interaction, msg)
 
     @discord.ui.button(label='Harvest Ready', emoji='🧺', style=discord.ButtonStyle.success, row=1)
@@ -2104,7 +2104,7 @@ class HarvestTestView(discord.ui.View):
                         f'🧪💧 **Harvest Hustle TEST — Your crops need watering!**\n'
                         f'{len(newly_thirsty)} crop(s) are thirsty ({names}).\n'
                         'Return to your private `/harvest test` dashboard and click **💧 Water Crops**. '
-                        'Unwatered crops take 25% longer to mature.')
+                        'Watering reduces the growth timer by 10%.')
                 except (discord.Forbidden, discord.HTTPException):
                     logging.info('Test watering DM blocked for user %s', self.host_id)
             msg=(f'Advanced to hour {self.test_hour}/168. '
