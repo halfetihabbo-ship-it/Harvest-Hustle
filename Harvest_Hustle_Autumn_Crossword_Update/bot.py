@@ -389,7 +389,7 @@ class FarmView(discord.ui.View):
 
     @discord.ui.button(label='Sell Produce',emoji='🪙',style=discord.ButtonStyle.primary,row=0)
     async def sell(self,interaction,button):
-        await do_sell(interaction,self.uid)
+        await show_sell_menu(interaction,self.uid)
 
     @discord.ui.button(label='Upgrades',emoji='⬆️',style=discord.ButtonStyle.secondary,row=2)
     async def upgrades(self,interaction,button):
@@ -741,23 +741,77 @@ async def do_harvest(interaction,uid):
             con.commit()
     await show_farm(interaction, latest_action='🧺 **Harvest:** ' + msg, edit_existing=True)
 
-async def do_sell(interaction,uid):
+class CropSellSelect(discord.ui.Select):
+    def __init__(self, items, prices):
+        options = [discord.SelectOption(
+            label=f"{CROPS[r['crop']]['name']} ×{r['qty']}",
+            value=r['crop'],
+            description=f"Sell all {r['qty']} for {r['qty'] * prices[r['crop']]:,} coins"
+        ) for r in items]
+        super().__init__(placeholder='Choose crops to sell (one or more)',
+                         min_values=1, max_values=len(options), options=options)
+
+    async def callback(self, interaction):
+        uid = interaction.user.id
+        chosen = tuple(self.values)
+        async with lock:
+            e = event()
+            p = player(uid)
+            if not active(e) or not p:
+                msg = 'The event is not active or you have not joined.'
+            else:
+                # Recheck quantities and prices at purchase time to avoid stale menus.
+                items = list(con.execute(
+                    f"SELECT crop,qty FROM inventory WHERE user_id=? AND crop IN ({','.join('?' for _ in chosen)}) AND qty>0",
+                    (uid, *chosen)))
+                if not items:
+                    msg = 'Those crops are no longer in your inventory. Open Sell Produce again.'
+                else:
+                    earned = sum(r['qty'] * sale_unit(e,p,r['crop']) for r in items)
+                    quantity = sum(r['qty'] for r in items)
+                    for r in items:
+                        con.execute('DELETE FROM inventory WHERE user_id=? AND crop=?', (uid,r['crop']))
+                    con.execute('UPDATE players SET coins=coins+?,sold=sold+? WHERE user_id=?',
+                                (earned,earned,uid))
+                    log_action(uid,e,'sell',', '.join(f"{r['crop']} x{r['qty']}" for r in items),earned)
+                    con.commit()
+                    msg = (f'🪙 Sold {quantity} crop(s) for {earned:,} coins: ' +
+                           ', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in items) +
+                           '. All unselected crops remain in your inventory.')
+        # Update the private sell menu with a confirmation; player can refresh farm separately.
+        await interaction.response.edit_message(embed=make_embed('🪙 Crop Sale',msg,AUTUMN['green']),view=None)
+
+
+class CropSellView(discord.ui.View):
+    def __init__(self, uid, items, prices):
+        super().__init__(timeout=180)
+        self.uid=uid
+        self.add_item(CropSellSelect(items,prices))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message('This is not your crop-selling menu.',ephemeral=True)
+            return False
+        return True
+
+
+async def show_sell_menu(interaction,uid):
     async with lock:
         e=event()
-        if not active(e) or not player(uid): msg='The event is not active or you have not joined.'
+        p=player(uid)
+        if not active(e) or not p:
+            msg='The event is not active or you have not joined.'
+            items=[]
+            prices={}
         else:
-            sync_actions(uid,e)
-            p=player(uid)
-            items=list(con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,)))
-            if not items: msg='🧺 Nothing to sell yet. Wait until crops are ready, click **Harvest Ready**, then click **Sell Produce**.'
-            else:
-                earned=sum(r['qty']*sale_unit(e,p,r['crop']) for r in items)
-                con.execute('DELETE FROM inventory WHERE user_id=?',(uid,))
-                con.execute('UPDATE players SET coins=coins+?,sold=sold+? WHERE user_id=?',(earned,earned,uid))
-                log_action(uid,e,'sell',f'{sum(x["qty"] for x in items)} crops',earned)
-                msg=f'🪙 Sold {sum(x["qty"] for x in items)} crop(s) for {earned} coins (free).'
-            con.commit()
-    await show_farm(interaction, latest_action='🪙 **Selling:** ' + msg, edit_existing=True)
+            items=list(con.execute('SELECT crop,qty FROM inventory WHERE user_id=? AND qty>0 ORDER BY crop',(uid,)))
+            prices={r['crop']:sale_unit(e,p,r['crop']) for r in items}
+            msg=('Select one or more crop types below. **All stored units** of each selected type will be sold. '
+                 'Crops you do not select stay in your inventory.\n\n' +
+                 '\n'.join(f"{CROPS[r['crop']]['name']} ×{r['qty']} — {r['qty']*prices[r['crop']]:,}c" for r in items)) if items else 'No harvested crops in your inventory yet.'
+    await interaction.response.send_message(embed=make_embed('🪙 Choose Crops to Sell',msg,AUTUMN['gold']),
+                                            view=CropSellView(uid,items,prices) if items else None,ephemeral=True)
+
 
 async def do_pests(interaction, uid):
     async with lock:
