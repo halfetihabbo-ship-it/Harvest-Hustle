@@ -907,6 +907,7 @@ official_con.commit()
 
 # Store every panel so role sign-ups can refresh all visible counters.
 official_con.execute('CREATE TABLE IF NOT EXISTS role_panel_messages(message_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)')
+official_con.execute('CREATE TABLE IF NOT EXISTS secondary_join_panels(message_id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL)')
 official_con.commit()
 
 
@@ -1114,6 +1115,19 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         await refresh_role_panel_counts(after.guild)
 
 
+def registration_message_authorized(message: discord.Message, e) -> bool:
+    """Accept the original registration post and host-created secondary join panels."""
+    if message.author.id != bot.user.id:
+        return False
+    if message.id == e['registration_post_id']:
+        return True
+    record = official_con.execute(
+        'SELECT 1 FROM secondary_join_panels WHERE message_id=? AND channel_id=?',
+        (message.id, message.channel.id),
+    ).fetchone()
+    return record is not None
+
+
 class HarvestRegistrationView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1123,7 +1137,7 @@ class HarvestRegistrationView(discord.ui.View):
     async def register(self, interaction: discord.Interaction, button: discord.ui.Button):
         async with lock:
             e = event()
-            if not registration_open(e) or not interaction.message or interaction.message.id != e['registration_post_id']:
+            if not registration_open(e) or not interaction.message or not registration_message_authorized(interaction.message, e):
                 message = 'Joining is not open yet, or the event has ended. Please use the official registration post.'
             elif player(interaction.user.id):
                 message = ('🌾 You have already joined! Open `/harvest farm` to play now.' if active(e) else '🌾 You have already joined! Farming opens 8 November at 00:00 GMT.')
@@ -1266,6 +1280,45 @@ async def start(interaction: discord.Interaction):
         con.execute('UPDATE event SET registration_post_id=?,registration_channel_id=? WHERE id=1', (message.id, channel.id))
         con.commit()
     await interaction.followup.send(f'🌾 Official Join announcement posted in {channel.mention}. The event ends 15 November 2026 at 00:00 GMT.', ephemeral=True)
+
+
+@harvest.command(name='join-panel', description='Host only: add another Join button to the game channel without replacing the original')
+async def join_panel(interaction: discord.Interaction):
+    if not is_host(interaction):
+        await interaction.response.send_message('Host only.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with lock:
+        e = event()
+        if not registration_open(e) or not e['registration_post_id']:
+            await interaction.followup.send('The official event must be started with `/harvest start` before adding another Join panel.', ephemeral=True)
+            return
+        channel = bot.get_channel(CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(CHANNEL_ID)
+            except discord.HTTPException:
+                await interaction.followup.send('Could not access the game channel.', ephemeral=True)
+                return
+        try:
+            message = await channel.send(
+                embed=registration_embed(live_test=False),
+                view=HarvestRegistrationView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            logging.exception('Unable to post additional Join panel')
+            await interaction.followup.send('Could not post the additional Join panel. Check bot permissions.', ephemeral=True)
+            return
+        official_con.execute(
+            'INSERT OR REPLACE INTO secondary_join_panels(message_id, channel_id) VALUES(?, ?)',
+            (message.id, channel.id),
+        )
+        official_con.commit()
+    await interaction.followup.send(
+        f'🌱 Additional Join panel posted in {channel.mention}. The original announcement is unchanged; both buttons use the same registration.',
+        ephemeral=True,
+    )
 
 
 @harvest.command(name='farm',description='Open your private farming menu')
