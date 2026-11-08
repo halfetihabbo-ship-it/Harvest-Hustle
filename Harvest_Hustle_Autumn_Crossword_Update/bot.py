@@ -1762,7 +1762,7 @@ async def economy_watcher():
              '☀️ Sunshine: new crops grow 10% faster. 🌧️ Rain/Irrigation: thirsty crops watered automatically. 🍃 Breeze: new crops get +5% harvest bonus.\n'
              f'🚚 **NEXT DELIVERY IN 6 HOURS:** {forecast["qty"]} × {CROPS[forecast["crop"]]["name"]} ({forecast["kind"]}).\n'
              'Open **/harvest farm** → **Harvest Deliveries** for currently active orders.')
-        await send_announcement_checked(msg, channel_id=ECONOMY_CHANNEL_ID)
+        await send_announcement_checked(msg, ping=True, channel_id=ECONOMY_CHANNEL_ID)
     for r in alerts:
         try:
             user=bot.get_user(r['user_id']) or await bot.fetch_user(r['user_id'])
