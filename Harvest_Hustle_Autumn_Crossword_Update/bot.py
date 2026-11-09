@@ -510,8 +510,12 @@ def animals_embed(uid):
     for a in rows:
         species=ANIMALS[a['species']]
         batches=livestock_batches(a,now)
-        next_ts=a['last_collection_ts']+species['hours']*3600
-        status=(f'🧺 {batches}/2 ready' if batches else f'⏳ Next <t:{next_ts}:R>')
+        period=species['hours']*3600
+        if batches >= 2:
+            status='🧺 2/2 stored · ⏸️ Production paused'
+        else:
+            next_ts=a['last_collection_ts']+(batches+1)*period
+            status=f'🧺 {batches}/2 stored · ⏳ Next <t:{next_ts}:R>'
         lines.append(f'**#{a["id"]} {species["name"]}** · {status}')
     desc=(f'**Animals:** {len(rows)}/{ANIMAL_LIMIT}  •  **Coins:** {p["coins"]:,}c\n'
           'Each animal stores **up to two batches**. Production pauses when full.\n'
@@ -558,7 +562,11 @@ async def animal_collect(interaction,uid):
                 qty=livestock_batches(a,now)
                 if not qty:continue
                 totals[a['species']]=totals.get(a['species'],0)+qty
-                con.execute('UPDATE livestock SET last_collection_ts=?,notified=0 WHERE id=?',(now,a['id']))
+                # At 1/2, preserve progress toward the second batch when collecting.
+                # At 2/2, the animal was paused, so restart its cycle on collection.
+                period=ANIMALS[a['species']]['hours']*3600
+                next_start=(a['last_collection_ts']+period) if qty == 1 else now
+                con.execute('UPDATE livestock SET last_collection_ts=?,notified=0 WHERE id=?',(next_start,a['id']))
             for species,qty in totals.items():
                 con.execute('INSERT INTO animal_inventory(user_id,species,qty) VALUES(?,?,?) ON CONFLICT(user_id,species) DO UPDATE SET qty=qty+excluded.qty',(uid,species,qty))
             if totals:log_action(uid,e,'collect_animals',str(totals))
@@ -993,8 +1001,6 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
         embed.add_field(name='💰 Coins',value=str(p['coins']))
         embed.add_field(name='🌱 Planting',value='Unlimited · requires coins and an empty plot')
         embed.add_field(name='🏆 Farm value',value=f'{farm_value(uid,p,e):,}')
-        next_reset=e['start_ts']+(w+1)*WINDOW
-        if active(e): embed.add_field(name='⏳ Next planting reset',value=stamp(next_reset),inline=False)
         milestone=max((n for n in (5,15,30,50) if p['harvested']>=n),default=0)
         embed.add_field(name='🏅 Harvest milestone',value=f'{milestone} crops' if milestone else 'Not yet unlocked',inline=True)
         embed.add_field(name='🌱 Plots Owned',value=f'{available_plots(p)}/{PLOTS + UPGRADES["extra_plot"]["max"]} · {len(plots)} occupied · {available_plots(p)-len(plots)} empty',inline=False)
@@ -1165,6 +1171,17 @@ async def on_message(message: discord.Message):
             logging.exception('Discord failed to delete message in game channel %s', CHANNEL_ID)
         return
     await bot.process_commands(message)
+
+@bot.tree.command(name='gmt', description='Display the current time in Greenwich Mean Time (GMT)')
+async def gmt(interaction: discord.Interaction):
+    now = datetime.now(timezone.utc)
+    embed = discord.Embed(
+        title='🕒 Current GMT Time',
+        description=f'**{now.strftime("%H:%M:%S")} GMT**\n{now.strftime("%A, %d %B %Y")}',
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text='GMT is UTC+0 and does not change for daylight saving time.')
+    await interaction.response.send_message(embed=embed)
 
 harvest=app_commands.Group(name='harvest',description='Harvest Hustle farming competition')
 
