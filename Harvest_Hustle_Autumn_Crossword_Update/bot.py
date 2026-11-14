@@ -21,7 +21,7 @@ ROLE_PANEL_CHANNEL_ID = int(os.environ.get('ROLE_PANEL_CHANNEL_ID', '15679805029
 ROLE_ID = int(os.environ.get('EVENT_ROLE_ID', '1567982021106602065'))
 DB_PATH = os.environ.get('DATABASE_PATH', 'harvest.sqlite3')
 WINDOW = 12 * 3600
-DURATION = 16 * WINDOW  # Ends 16 Nov 00:00 GMT; last playable minute is 15 Nov 23:59 GMT
+DURATION = 16 * WINDOW  # Exclusive cutoff: 16 Nov 00:00 GMT; display deadline: 15 Nov 23:59 GMT
 FARMING_AT = int(datetime(2026, 11, 8, 0, 0, tzinfo=timezone.utc).timestamp())
 ACTIONS = 10  # Starting actions; each purchased plot adds one action per session.
 START_COINS = 2000
@@ -328,6 +328,9 @@ def board(e):
     # Tie rule: farm value, lifetime sales, lifetime harvests, then earliest join.
     rows.sort(key=lambda x:(-x[0],-x[1],-x[2],player(x[3])['joined_ts'],x[3]))
     return rows
+
+def event_deadline_label():
+    return "15th November 2026 at 23:59PM GMT"
 
 def stamp(ts):
     return f'<t:{int(ts)}:F> (<t:{int(ts)}:R>)'
@@ -992,7 +995,7 @@ async def show_farm(interaction, latest_action=None, edit_existing=False):
                 potion_mark = ' 🧪 Potion applied' if r['potion_used'] else ''
                 lines.append(f'**{slot}.** {c["name"]} — '+('✅ **Ready! Click Harvest Ready**' if remaining==0 else f'⏳ **{duration} left** · <t:{ready_ts}:t>' + potion_mark + care))
         inv=', '.join(f"{CROPS[r['crop']]['name']} ×{r['qty']}" for r in con.execute('SELECT * FROM inventory WHERE user_id=? AND qty>0',(uid,))) or 'Empty'
-        embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 8**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {stamp(e["start_ts"]+DURATION)}', AUTUMN['green'])
+        embed=make_embed('🍁 Your Autumn Farm',f'**Day {w//2+1} of 8**  •  Session {w%2+1} of 2\n🏁 **Event ends:** {event_deadline_label()}', AUTUMN['green'])
         condition=current_conditions(e)
         if condition:
             embed.add_field(name='🌦️ Current Weather / 📈 Market',value=f'{condition["weather"].title()} · {CROPS[condition["market_crop"]]["name"]} {condition["market_pct"]:+.0%} · updates every 6h',inline=False)
@@ -1083,7 +1086,7 @@ def role_panel_embed(signups: int, with_banner: bool = False):
     )
     embed.add_field(
         name='📅 EVENT DATES',
-        value='🟢 **Starts:** 8 November, 12:00 AM GMT\n🔴 **Ends:** 15 November, 11:59 PM GMT',
+        value='🟢 **Starts:** 8 November, 12:00 AM GMT\n🔴 **Ends:** 15th November at 23:59PM GMT',
         inline=False,
     )
     embed.add_field(
@@ -1171,6 +1174,25 @@ async def on_message(message: discord.Message):
             logging.exception('Discord failed to delete message in game channel %s', CHANNEL_ID)
         return
     await bot.process_commands(message)
+
+@bot.tree.command(name='timer', description='Show the time remaining until Harvest Hustle ends')
+async def timer(interaction: discord.Interaction):
+    deadline = FARMING_AT + DURATION
+    remaining_seconds = max(0, deadline - int(time.time()))
+    if remaining_seconds == 0:
+        message = '**Harvest Hustle has ended!**'
+    else:
+        hours, remainder = divmod(remaining_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        message = f'**{hours} hours, {minutes} minutes, {seconds} seconds** remaining.'
+    embed = discord.Embed(
+        title='⏳ Harvest Hustle Countdown',
+        description=message,
+        color=discord.Color.green(),
+    )
+    embed.add_field(name='Event Ends', value='15th November at 23:59 GMT', inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 @bot.tree.command(name='gmt', description='Display the current time in Greenwich Mean Time (GMT)')
 async def gmt(interaction: discord.Interaction):
@@ -1318,7 +1340,7 @@ def registration_embed(live_test=False):
             'Click **Join Harvest Hustle** below to enter the competition!\n\n'
             + ('🧪 **LIVE TEST IS ACTIVE — farming is available NOW!**\n' if live_test else '🌱 **Farming begins:** 8 November, 00:00 GMT\n')
             + '🏆 **Prizes:** 1st 200c + HC Box · 2nd 100c + HC Box · 3rd 75c + HC Box\n\n'
-            '🏁 **Event ends:** 15 November 2026, 11:59 PM GMT\n'
+            '🏁 **Event ends:** 15th November at 23:59PM GMT\n'
             '📖 Want to know how it works? Use `/harvest help`.'
         ),
         color=discord.Color.from_rgb(160, 104, 49)
@@ -1438,7 +1460,7 @@ async def start(interaction: discord.Interaction):
             con.execute('INSERT INTO event(id,start_ts,ended) VALUES(1,?,0)', (FARMING_AT,))
         con.execute('UPDATE event SET registration_post_id=?,registration_channel_id=? WHERE id=1', (message.id, channel.id))
         con.commit()
-    await interaction.followup.send(f'🌾 Official Join announcement posted in {channel.mention}. The event ends 15 November 2026 at 23:59 GMT.', ephemeral=True)
+    await interaction.followup.send(f'🌾 Official Join announcement posted in {channel.mention}. The event ends 15th November at 23:59PM GMT.', ephemeral=True)
 
 
 @harvest.command(name='join-panel', description='Host only: add another Join button to the game channel without replacing the original')
@@ -1567,7 +1589,7 @@ async def status(interaction:discord.Interaction):
         if not e: msg='No event has started.'
         else:
             count=con.execute('SELECT COUNT(*) FROM players').fetchone()[0]
-            msg=f'**Status:** {"Finished" if e["ended"] else "Live" if active(e) else "Registration" if registration_open(e) else "Closing"}\n**Players:** {count}\n**Start:** {stamp(e["start_ts"])}\n**End:** {stamp(e["start_ts"]+DURATION)}'
+            msg=f'**Status:** {"Finished" if e["ended"] else "Live" if active(e) else "Registration" if registration_open(e) else "Closing"}\n**Players:** {count}\n**Start:** {stamp(e["start_ts"])}\n**End:** {event_deadline_label()}'
     await interaction.response.send_message(msg,ephemeral=True)
 
 @harvest.command(name='reset',description='Host only: delete a completed event to prepare a new one')
@@ -1753,7 +1775,7 @@ async def dashboard(interaction:discord.Interaction):
         leaders=board(e)[:5]
         recent=list(con.execute('SELECT user_id,action,detail,coin_change,ts FROM transactions ORDER BY id DESC LIMIT 8'))
         desc=(f'**Registrations:** {total}\n**Active last 24h:** {last}\n**Total transactions:** {actions}\n'
-              f'**Farming start:** {stamp(e["start_ts"])}\n**End:** {stamp(e["start_ts"]+DURATION)}\n\n'
+              f'**Farming start:** {stamp(e["start_ts"])}\n**End:** {event_deadline_label()}\n\n'
               '**Top farms**\n'+('\n'.join(f'{i}. <@{r[3]}> — {r[0]:,}c' for i,r in enumerate(leaders,1)) or 'None')+'\n\n'
               '**Recent actions**\n'+('\n'.join(f'<@{r["user_id"]}> · {r["action"]} ({r["detail"]})' for r in recent) or 'None'))
     await interaction.response.send_message(embed=make_embed('🛡️ Host Monitoring Dashboard',desc[:4000]),ephemeral=True)
